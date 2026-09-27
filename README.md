@@ -3,16 +3,26 @@
 让小爱同学(或任意支持 **Streamable HTTP** 的 MCP 客户端)接入本机能力的 MCP 服务器。
 运行环境是一台跑在 Android 上的 Debian(aarch64),因此工具可以直接操作手机共享存储、执行命令、调用 MiMoCode 等。
 
-- `http-server.js` — Streamable HTTP 版 MCP 服务器(主力,端口 3000)
-- `server.js` — 原 stdio 版 MCP 服务器(保留未改动)
+## 项目结构
+
+```
+.
+├── LICENSE
+├── McpServer/          # MCP 服务器(源码、依赖、详细文档)
+│   ├── README.md       # 完整文档:接入方式、工具列表、安全提示
+│   ├── http-server.js  # Streamable HTTP 版 MCP 服务器(主力,端点 3000/mcp)
+│   ├── server.js       # 原 stdio 版 MCP 服务器(保留未改动)
+│   ├── package.json
+│   └── node_modules/
+└── README.md
+```
 
 ## 快速开始
 
 ```bash
+cd McpServer
 npm install
 node http-server.js        # 默认监听 0.0.0.0:3000,端点 /mcp
-# 或指定端口
-PORT=3000 node http-server.js
 ```
 
 启动成功会打印:
@@ -32,22 +42,11 @@ MCP Streamable HTTP server running at http://0.0.0.0:3000/mcp
 | 名称 | 随意(如 `node`) |
 | 地址 | `http://<本机IP>:3000/mcp` |
 
-添加后在 MCP 服务页开启该服务,即可看到下方工具列表并由小爱调用。
+## 工具列表(共 4 个)
 
-## 工具列表(共 7 个)
+`run_command`、`get_find_file`、`ask_mimocode`、`video_upload`
 
-| 工具 | 说明 |
-| --- | --- |
-| `hello` | 向指定的人打招呼 |
-| `calculator` | 计算两个数的加减乘除 |
-| `get_weather` | 获取指定城市的天气 |
-| `run_command` | 在设备上执行 shell 命令 |
-| `get_find_file` | 按文件名关键词或通配符(如 `*.log`、`report*`)搜索文件,返回路径,可选返回文件内容 |
-| `ask_mimocode` | 把消息发给 MiMoCode agent 无头执行并返回回答,支持 `session_id` 续接多轮对话 |
-| `video_upload` | 以 base64 上传文件到 `Video/<年月日>/`,文件名撞名自动加序号 |
-
-> 传输层为 MCP Streamable HTTP:`POST` 收 JSON-RPC(响应为 SSE 帧),`GET` 为 SSE 事件流,`DELETE` 结束会话;需要带 `Content-Type: application/json` 与 `Accept: application/json, text/event-stream`。
-> 请求体上限已放宽到 `512mb`(`video_upload` 传大文件用)。
+详细的工具说明、传输层协议细节与接入步骤见 **[McpServer/README.md](McpServer/README.md)**。
 
 ## ⚠ 安全提示
 

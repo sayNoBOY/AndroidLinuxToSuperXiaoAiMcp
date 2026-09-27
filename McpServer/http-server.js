@@ -84,44 +84,6 @@ function createServer() {
   });
 
   server.tool(
-    "hello",
-    "向指定的人打招呼",
-    { name: z.string().describe("你的名字") },
-    async ({ name }) => ({
-      content: [{ type: "text", text: `你好，${name}！` }],
-    })
-  );
-
-  server.tool(
-    "calculator",
-    "计算两个数的加减乘除",
-    {
-      operation: z.enum(["add", "subtract", "multiply", "divide"]),
-      a: z.number(),
-      b: z.number(),
-    },
-    async ({ operation, a, b }) => {
-      let result;
-      switch (operation) {
-        case "add": result = a + b; break;
-        case "subtract": result = a - b; break;
-        case "multiply": result = a * b; break;
-        case "divide": result = b !== 0 ? a / b : "除数不能为0"; break;
-      }
-      return { content: [{ type: "text", text: String(result) }] };
-    }
-  );
-
-  server.tool(
-    "get_weather",
-    "获取指定城市的天气",
-    { city: z.string().describe("城市名") },
-    async ({ city }) => ({
-      content: [{ type: "text", text: `${city}：晴天，28°C` }],
-    })
-  );
-
-  server.tool(
     "run_command",
     "在设备上执行shell命令",
     { command: z.string().describe("要执行的命令") },
