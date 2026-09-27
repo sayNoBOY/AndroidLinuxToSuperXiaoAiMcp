@@ -10,8 +10,8 @@
 ├── LICENSE
 ├── McpServer/          # MCP 服务器(源码、依赖、详细文档)
 │   ├── README.md       # 完整文档:接入方式、工具列表、安全提示
-│   ├── http-server.js  # 服务入口:express app + 工具定义(端点 3000/mcp)
-│   ├── McpApi.js       # /mcp 路由封装:POST/GET/DELETE 与会话管理
+│   ├── http-server.js  # 服务入口:创建 express app 并监听 3000/mcp
+│   ├── McpApi.js       # MCP 服务实现:4 个工具定义 + /mcp 路由与会话管理
 │   ├── server.js       # 原 stdio 版 MCP 服务器(保留未改动)
 │   ├── package.json
 │   └── node_modules/
