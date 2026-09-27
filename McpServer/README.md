@@ -4,6 +4,7 @@
 运行环境是一台跑在 Android 上的 Debian(aarch64),因此工具可以直接操作手机共享存储、执行命令、调用 MiMoCode 等。
 
 - `http-server.js` — Streamable HTTP 版 MCP 服务器(主力,端口 3000)
+- `McpApi.js` — `/mcp` 路由封装(POST/GET/DELETE 与会话管理),由 `http-server.js` 引入
 - `server.js` — 原 stdio 版 MCP 服务器(保留未改动)
 
 ## 快速开始

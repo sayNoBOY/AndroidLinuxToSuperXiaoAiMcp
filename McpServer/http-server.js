@@ -1,8 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { randomUUID } from "node:crypto";
 import express from "express";
 import { z } from "zod";
+
+import { mountMcpApi } from "./McpApi.js";
 
 const app = express();
 // 视频等大文件 base64 后体积更大，放宽 body 限制
@@ -314,73 +314,7 @@ function createServer() {
   return server;
 }
 
-// sessionId -> transport（每个会话对应一个 McpServer 实例）
-const transports = {};
-
-app.post("/mcp", async (req, res) => {
-  try {
-    const sessionId = req.headers["mcp-session-id"];
-    let transport;
-
-    if (sessionId && transports[sessionId]) {
-      transport = transports[sessionId];
-    } else if (!sessionId && req.body?.method === "initialize") {
-      const server = createServer();
-      transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (sid) => {
-          transports[sid] = transport;
-        },
-      });
-      transport.onclose = () => {
-        if (transport.sessionId) {
-          delete transports[transport.sessionId];
-        }
-      };
-      await server.connect(transport);
-    } else {
-      res.status(400).json({
-        jsonrpc: "2.0",
-        error: { code: -32000, message: "Bad Request: no valid session" },
-        id: null,
-      });
-      return;
-    }
-
-    await transport.handleRequest(req, res, req.body);
-  } catch (e) {
-    console.error("POST /mcp error:", e);
-    if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: "2.0",
-        error: { code: -32603, message: "Internal server error" },
-        id: null,
-      });
-    }
-  }
-});
-
-// GET：SSE 通知流（复用已有会话）
-app.get("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"];
-  const transport = sessionId && transports[sessionId];
-  if (!transport) {
-    res.status(400).send("Invalid or missing session ID");
-    return;
-  }
-  await transport.handleRequest(req, res);
-});
-
-// DELETE：终止会话
-app.delete("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"];
-  const transport = sessionId && transports[sessionId];
-  if (!transport) {
-    res.status(400).send("Invalid or missing session ID");
-    return;
-  }
-  await transport.handleRequest(req, res);
-});
+mountMcpApi(app, createServer);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
