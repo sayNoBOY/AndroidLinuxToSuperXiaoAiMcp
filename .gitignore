@@ -33,3 +33,6 @@ Thumbs.db
 
 # Runtime SQLite data (McpServer/LoginApi.js)
 McpServer/data/
+
+# Playwright test artifacts
+.playwright-cli/
