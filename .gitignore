@@ -30,3 +30,6 @@ Thumbs.db
 
 # Tool state
 .mimocode/
+
+# Runtime SQLite data (McpServer/LoginApi.js)
+McpServer/data/

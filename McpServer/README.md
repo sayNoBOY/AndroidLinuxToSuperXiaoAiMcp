@@ -3,8 +3,9 @@
 让小爱同学(或任意支持 **Streamable HTTP** 的 MCP 客户端)接入本机能力的 MCP 服务器。
 运行环境是一台跑在 Android 上的 Debian(aarch64),因此工具可以直接操作手机共享存储、执行命令、调用 MiMoCode 等。
 
-- `http-server.js` — 服务入口:创建 express app、挂载 `/mcp`、监听端口 3000
+- `http-server.js` — 服务入口:创建 express app、挂载 `/mcp` 与登录认证接口、监听端口 3000
 - `McpApi.js` — MCP 服务实现:4 个工具定义与 `/mcp` 路由(POST/GET/DELETE 与会话管理)
+- `LoginApi.js` — 登录认证接口:`/api/v1/auth` 下的 login/refresh/logout/me(SQLite + JWT),随 http-server 一起启动,也可 `node LoginApi.js` 单独跑(同为 3000 端口)
 - `server.js` — 原 stdio 版 MCP 服务器(保留未改动)
 
 ## 快速开始
@@ -21,6 +22,7 @@ PORT=3000 node http-server.js
 
 ```
 MCP Streamable HTTP server running at http://0.0.0.0:3000/mcp
+Login API running at http://0.0.0.0:3000/api/v1/auth
 ```
 
 要求 Node.js 18+(项目为 ESM,`"type": "module"`)。
