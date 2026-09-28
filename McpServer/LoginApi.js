@@ -11,6 +11,7 @@
  *
  * 挂载方式：import { mountLoginApi } from "./LoginApi.js"; mountLoginApi(app);
  * 独立运行：node LoginApi.js  （默认 0.0.0.0:3000，与文档 Base URL 一致）
+ * 导出：getDb / requireAuth / verifyAccessToken / isPrivateOrigin（TaskApi.js 复用认证与 CORS 策略）
  */
 import path from "node:path";
 import fs from "node:fs";
@@ -224,32 +225,53 @@ function publicUser(row) {
   };
 }
 
-async function requireAuth(req, res, next) {
+/**
+ * 校验 access_token：签名、类型、吊销、用户存在。
+ * 成功返回 { payload, user }；失败抛出带 api = { status, message, type, detail } 的错误。
+ * 供 requireAuth（HTTP）与 TaskApi 的 WebSocket 握手复用。
+ */
+export async function verifyAccessToken(token, secret = getJwtSecret()) {
+  const apiError = (message, type, detail = message) => {
+    const err = new Error(detail);
+    err.api = { status: 401, message, type, detail };
+    return err;
+  };
+
+  let payload;
+  try {
+    ({ payload } = await jwtVerify(token, secret));
+  } catch (e) {
+    if (e?.code === "ERR_JWT_EXPIRED") throw apiError("Token expired", "AUTH_EXPIRED", "访问令牌已过期");
+    throw apiError("Token invalid", "AUTH_INVALID", "访问令牌无效");
+  }
+
+  purgeRevoked();
+  if (payload.type !== "access" || revoked.has(payload.jti)) {
+    throw apiError("Token invalid", "AUTH_INVALID", "访问令牌无效或已退出登录");
+  }
+
+  const user = getDb().prepare("SELECT * FROM users WHERE user_id = ?").get(Number(payload.sub));
+  if (!user) throw apiError("Token invalid", "AUTH_INVALID", "用户不存在");
+
+  return { payload, user };
+}
+
+export async function requireAuth(req, res, next) {
   try {
     const header = req.headers.authorization || "";
     const m = /^Bearer\s+(.+)$/i.exec(header);
     if (!m) return fail(res, 401, "缺少访问令牌", "MISSING_TOKEN");
 
-    let payload;
+    let result;
     try {
-      ({ payload } = await jwtVerify(m[1], req.app.locals.loginSecret));
+      result = await verifyAccessToken(m[1], req.app.locals.loginSecret);
     } catch (e) {
-      if (e?.code === "ERR_JWT_EXPIRED") {
-        return fail(res, 401, "Token expired", "AUTH_EXPIRED", "访问令牌已过期");
-      }
-      return fail(res, 401, "Token invalid", "AUTH_INVALID", "访问令牌无效");
+      if (e.api) return fail(res, e.api.status, e.api.message, e.api.type, e.api.detail);
+      throw e;
     }
 
-    purgeRevoked();
-    if (payload.type !== "access" || revoked.has(payload.jti)) {
-      return fail(res, 401, "Token invalid", "AUTH_INVALID", "访问令牌无效或已退出登录");
-    }
-
-    const user = db.prepare("SELECT * FROM users WHERE user_id = ?").get(Number(payload.sub));
-    if (!user) return fail(res, 401, "Token invalid", "AUTH_INVALID", "用户不存在");
-
-    req.auth = payload;
-    req.user = user;
+    req.auth = result.payload;
+    req.user = result.user;
     next();
   } catch (e) {
     next(e);
@@ -260,7 +282,7 @@ async function requireAuth(req, res, next) {
 // 路由
 // ---------------------------------------------------------------------------
 
-function isPrivateOrigin(origin, cb) {
+export function isPrivateOrigin(origin, cb) {
   if (!origin) return cb(null, true); // 原生客户端不带 Origin
   let host;
   try {

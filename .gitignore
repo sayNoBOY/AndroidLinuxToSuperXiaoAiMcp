@@ -34,5 +34,8 @@ Thumbs.db
 # Runtime SQLite data (McpServer/LoginApi.js)
 McpServer/data/
 
+# Task artifact output (McpServer/TaskApi.js)
+McpServer/taskRes/
+
 # Playwright test artifacts
 .playwright-cli/
