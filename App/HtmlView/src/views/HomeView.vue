@@ -1,10 +1,11 @@
 <script setup>
-import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import {
   listTasks, createTask, getTask, cancelTask, deleteTask,
   getMessages, sendMessage, getArtifacts, artifactUrl, uploadFiles,
   connectTaskEvents, setEventSeq,
 } from '../api/tasks.js'
+import { MD_RE, renderMarkdown } from '../lib/markdown.js'
 
 // 依据 随身互联开发文档/设计/随身互联App四Tab原型(6).html 首页（Tab1 任务中心）实现
 // 数据接 /api/v1/tasks，WS 实时刷新 + since 重放（断联中继）；除首页外的 Tab 仅保留视觉
@@ -47,6 +48,14 @@ const msgsBox = ref(null)
 
 // 产物预览（应用内全屏层，带返回按钮 —— 不再开新标签页）
 const previewArt = ref(null)
+
+// Markdown 预览：拉原文在前端渲染（服务端按 text/plain 直出是浏览器的未处理文本）
+const mdHtml = ref('')
+const mdRaw = ref('')
+const mdLoading = ref(false)
+const mdError = ref('')
+const mdMode = ref('render') // render = 渲染视图，source = 源码视图
+const isMdExt = (name) => MD_RE.test(name)
 
 // 消息全文弹窗（消息记录里长回复只显示 2 行，点击行查看全部）
 const fullMsg = ref(null)
@@ -287,6 +296,75 @@ function openPreview(a) {
 function closePreview() {
   previewArt.value = null
 }
+
+/** 打开 .md 产物时拉原文并渲染；用 artifact_id 挡住快速切换文件的竞态 */
+async function loadMd(a) {
+  const id = a.artifact_id
+  mdLoading.value = true
+  mdError.value = ''
+  try {
+    const res = await fetch(artifactUrl(detailTask.value.task_id, id, { inline: true }))
+    if (!res.ok) throw new Error(`加载失败（HTTP ${res.status}）`)
+    const text = await res.text()
+    if (previewArt.value?.artifact_id !== id) return // 已切到别的文件/已关闭
+    mdRaw.value = text
+    mdHtml.value = renderMarkdown(text, {
+      taskId: detailTask.value.task_id,
+      relPath: a.rel_path,
+      artifacts: detailArtifacts.value,
+      artifactUrl,
+    })
+  } catch (e) {
+    if (previewArt.value?.artifact_id !== id) return
+    mdError.value = e?.message || 'Markdown 加载失败'
+    mdRaw.value = ''
+    mdHtml.value = ''
+  } finally {
+    if (previewArt.value?.artifact_id === id) mdLoading.value = false
+  }
+}
+
+function retryMd() {
+  if (previewArt.value) loadMd(previewArt.value)
+}
+
+/** 渲染 / 源码 切换（源码视图复用同一份已拉取的原文） */
+function toggleMdMode() {
+  mdMode.value = mdMode.value === 'render' ? 'source' : 'render'
+}
+
+/** 代码块「复制」按钮：事件从 .md-view 委托进来 */
+async function onMdClick(e) {
+  const btn = e.target?.closest?.('.md-code-copy')
+  if (!btn) return
+  const code = btn.closest('.md-code')?.querySelector('code')?.textContent || ''
+  try {
+    await navigator.clipboard.writeText(code)
+  } catch {
+    // 非安全上下文（http 预览）没有 clipboard API，退回 execCommand
+    const ta = document.createElement('textarea')
+    ta.value = code
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    ta.remove()
+  }
+  btn.textContent = '已复制'
+  setTimeout(() => (btn.textContent = '复制'), 1500)
+}
+
+// 切换预览文件时重新加载 Markdown，并复位视图模式
+watch(previewArt, (a) => {
+  mdMode.value = 'render'
+  mdHtml.value = ''
+  mdRaw.value = ''
+  mdError.value = ''
+  mdLoading.value = false
+  if (a && isMdExt(a.filename) && detailTask.value) loadMd(a)
+})
+
 function onKeydown(e) {
   if (e.key !== 'Escape') return
   if (previewArt.value) return closePreview()
@@ -444,6 +522,14 @@ onUnmounted(() => {
           </div>
 
           <div class="task-ops">
+            <!-- 左下角：当前轮对话（列表接口的 current_round，新消息经 WS 重拉自动刷新） -->
+            <div v-if="t.current_round" class="task-round" :title="t.current_round.content">
+              <span class="round-tag" :class="{ pend: t.current_round.pending }">
+                {{ t.current_round.role === 'user' ? '我' : '助手'
+                }}{{ t.current_round.pending ? ' · 排队' : '' }}</span
+              >
+              <span class="round-text">{{ t.current_round.content }}</span>
+            </div>
             <template v-if="t.state === 'running'">
               <button class="btn sm line" @click="openDetail(t)">查看详情</button>
               <button class="btn sm line" @click="pauseStub">暂停</button>
@@ -686,11 +772,34 @@ onUnmounted(() => {
         <div class="preview-bar">
           <button class="btn sm line" @click="closePreview">← 返回</button>
           <span class="preview-name" :title="previewArt.rel_path">{{ previewArt.filename }}</span>
+          <!-- Markdown：渲染 / 源码 双视图切换 -->
+          <span v-if="isMdExt(previewArt.filename) && !mdError && !mdLoading" class="md-toggle">
+            <button
+              class="btn sm"
+              :class="mdMode === 'render' ? 'primary' : 'line'"
+              @click="mdMode = 'render'"
+            >渲染</button>
+            <button
+              class="btn sm"
+              :class="mdMode === 'source' ? 'primary' : 'line'"
+              @click="mdMode = 'source'"
+            >源码</button>
+          </span>
           <a class="btn sm green" :href="artifactUrl(detailTask.task_id, previewArt.artifact_id)" download>下载</a>
         </div>
-        <div class="preview-body" @click.self="closePreview">
+        <div class="preview-body" :class="{ 'md-body': isMdExt(previewArt.filename) }" @click.self="closePreview">
+          <!-- Markdown：前端渲染成文档（标题/表格/列表/代码高亮/图片内链…） -->
+          <div v-if="isMdExt(previewArt.filename)" class="md-wrap" @click="onMdClick">
+            <div v-if="mdLoading" class="center muted" style="padding: 40px 0">Markdown 渲染中…</div>
+            <div v-else-if="mdError" class="md-error">
+              <p>{{ mdError }}</p>
+              <button class="btn sm line" @click.stop="retryMd">重试</button>
+            </div>
+            <pre v-else-if="mdMode === 'source'" class="md-source">{{ mdRaw }}</pre>
+            <article v-else class="md-view" v-html="mdHtml"></article>
+          </div>
           <img
-            v-if="isImageExt(previewArt.filename)"
+            v-else-if="isImageExt(previewArt.filename)"
             :src="artifactUrl(detailTask.task_id, previewArt.artifact_id, { inline: true })"
             :alt="previewArt.filename"
           />
@@ -818,7 +927,19 @@ onUnmounted(() => {
 .task-name { font-size: 14px; font-weight: 600; color: var(--t1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
 .task-sub { font-size: 11px; color: var(--t3); margin-top: 2px }
 .task-st { text-align: right }
-.task-ops { display: flex; gap: 8px; margin-top: 10px; justify-content: flex-end }
+.task-ops { display: flex; gap: 8px; margin-top: 10px; justify-content: flex-end; align-items: center }
+/* 卡片左下角：当前轮对话预览（占满按钮左侧剩余宽度，超长省略） */
+.task-round {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--t3); text-align: left;
+}
+.round-tag {
+  flex-shrink: 0; font-size: 10.5px; line-height: 1.5; padding: 1px 6px;
+  border-radius: 6px; background: var(--card2); color: var(--t2); white-space: nowrap;
+}
+.round-tag.pend { color: var(--yellow) }
+.round-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.task-ops .btn { flex-shrink: 0 }
 
 /* ===== 底部导航 ===== */
 .tabbar {
@@ -994,4 +1115,108 @@ a.btn { text-decoration: none; justify-content: center }
 }
 .preview-body img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 8px }
 .preview-body iframe { width: 100%; height: 100%; border: none; border-radius: 8px; background: #fff }
+
+/* ---- Markdown 预览 ----
+   预览层原本是给图片/iframe 用的 flex 居中容器：内容一旦比视口宽，
+   居中溢出会让左右两侧同时被裁掉。md 模式改回常规块流，页面不横向溢出，
+   宽内容（表格/代码）在自己容器里横向滚动。 */
+.preview-body.md-body {
+  display: block;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.md-wrap {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  /* 关掉安卓浏览器的字号自动放大（Text Autosizing），避免预览文字忽大忽小、缩放后发虚 */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+/* v-html 里的节点没有当前组件的 scoped 属性，必须用 :deep 才能命中 */
+.md-view {
+  min-width: 0;
+  font-size: 15px;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.md-view :deep(img) { max-width: 100%; height: auto; border-radius: 8px }
+.md-view :deep(a) { word-break: break-all }
+/* 全局 code 是 inline-flex，长令牌断不开行会把整页撑宽：改回可断行 */
+.md-view :deep(code) {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.md-view :deep(.md-table) {
+  max-width: 100%;
+  margin: 10px 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.md-view :deep(.md-table table) { border-collapse: collapse }
+.md-view :deep(.md-table th),
+.md-view :deep(.md-table td) {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+}
+.md-view :deep(.md-table code) { max-width: none }
+.md-view :deep(.md-code) {
+  max-width: 100%;
+  margin: 10px 0;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--code-bg);
+  /* 同 .md-source：--code-bg 底上必须用高对比前景，继承的浅灰字看不清 */
+  color: var(--text-h);
+}
+.md-view :deep(.md-code-hd) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--t2);
+  background: color-mix(in srgb, var(--line) 60%, transparent);
+}
+.md-view :deep(.md-code pre) {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.md-view :deep(.md-code pre code) {
+  display: block;
+  max-width: none;
+  padding: 0;
+  background: none;
+  white-space: pre;
+  word-break: normal;
+}
+.md-source {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 10px 12px;
+  /* 源码保留空白与换行，但超宽自动折行：手机上不必横向拖动或捏合缩放
+     （缩放后浏览器重新栅格化文字会发虚），超长 token 同样能断开 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: hidden;
+  font-size: 14px;
+  line-height: 1.65;
+  tab-size: 4;
+  border-radius: 8px;
+  background: var(--code-bg);
+  /* 底色是 --code-bg，继承来的 --t1(#e5e7eb) 浅灰字压在上面几乎看不清；
+     换成与行内 code 一致的高对比前景：浅色底 = #08060d(近黑)，深色底 = #f3f4f6 */
+  color: var(--text-h);
+}
 </style>

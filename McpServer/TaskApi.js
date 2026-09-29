@@ -78,6 +78,7 @@ import {
   isPrivateOrigin,
   mountLoginApi,
 } from "./LoginApi.js";
+import { createNetworkWatcher } from "./NetworkWatch.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TASK_RES_DIR = path.join(__dirname, "taskRes"); // 每任务一个子目录存放产物
@@ -92,6 +93,13 @@ const EVENT_MAX_ROWS = 2_000; // task_events 全局保留行数上限（超出�
 const EVENT_PRUNE_MS = 10 * 60_000;
 const ACTIVE_STATES = new Set(["queued", "running"]);
 const ALL_STATES = new Set(["queued", "running", "completed", "failed", "cancelled"]);
+
+// 网络通断 → 断网挂起、恢复续跑（见文件头「断网恢复」小节）
+// 恢复判据：网络回到 online 时，仍在 activeRuns 里、且静默超过 STALL_MS 的运行
+// 视为"断网期间卡住"，杀掉后按 --session 续跑（不是执行超时：只在恢复瞬间对
+// 静默运行生效，持续产出事件的运行永不被杀）。
+const NET_RESUME_STALL_MS = 10_000; // 恢复时判定"卡住"的静默阈值
+const NET_RESUME_SETTLE_MS = 8_000; // 恢复后先宽限自愈，再对仍静默的运行续跑
 
 // ---------------------------------------------------------------------------
 // 通用响应结构：{ code, message, data, timestamp } / 错误 { code, message, error }
@@ -693,6 +701,19 @@ function pruneEvents() {
 // 终态处理器见此标志后不再写库/广播。
 const activeRuns = new Map();
 
+// ---------------------------------------------------------------------------
+// 网络状态：离线挂起派发、恢复后续跑（由 NetworkWatch 驱动）
+//   networkOnline   —— 当前网络是否可达（watcher 回调维护）
+//   lastActivity    —— 每个运行最近一次产出 NDJSON 事件的时间戳，恢复时据此
+//                      判定哪些运行在断网期间已静默"卡住"
+// ---------------------------------------------------------------------------
+let networkOnline = true;
+const runLastActivity = new Map(); // task_id → ms 时间戳
+
+function touchRun(taskId) {
+  runLastActivity.set(taskId, Date.now());
+}
+
 /**
  * 杀掉一次运行的整个进程组。
  *
@@ -714,7 +735,7 @@ function killRunTree(child) {
   }
 }
 
-function runMimo({ message, session_id, model, cwd, onSessionId }) {
+function runMimo({ taskId, message, session_id, model, cwd, onSessionId }) {
   // headless 运行无人应答权限弹窗，ask 会被自动拒绝导致工具调用直接失败；
   // 跳过在事件层自动放行，显式 deny 规则依然生效
   const args = ["run", "--dangerously-skip-permissions", message, "--format", "json"];
@@ -743,6 +764,7 @@ function runMimo({ message, session_id, model, cwd, onSessionId }) {
     } catch {
       return;
     }
+    if (taskId != null) touchRun(taskId);
     if (ev.sessionID && ev.sessionID !== sid) {
       sid = ev.sessionID;
       onSessionId?.(sid);
@@ -752,6 +774,7 @@ function runMimo({ message, session_id, model, cwd, onSessionId }) {
   };
 
   child.stdout.on("data", (d) => {
+    if (taskId != null) touchRun(taskId);
     buf += d;
     let i;
     while ((i = buf.indexOf("\n")) >= 0) {
@@ -803,6 +826,22 @@ function finalizeRun(taskId, run, result) {
   if (run.hb) clearInterval(run.hb);
   activeRuns.delete(taskId);
   if (run.canceling) return;
+
+  // 断网恢复续跑：杀进程触发的收尾。不落终态，把在执行的那条消息重新入队，
+  // 交回 dispatchNext 用 --session 重发续接（实测：空消息续接无输出，必须重发）。
+  if (run.resuming) {
+    runLastActivity.delete(taskId);
+    if (run.msgId != null) {
+      db
+        .prepare("UPDATE task_messages SET pending = 1 WHERE msg_id = ? AND role = 'user'")
+        .run(run.msgId);
+    }
+    const row = db.prepare("SELECT state FROM tasks WHERE task_id = ?").get(taskId);
+    // 任务仍处活跃态才续跑；已被 cancel/删除则不再动
+    if (row && ACTIVE_STATES.has(row.state)) dispatchNext(taskId);
+    return;
+  }
+
   const row = db.prepare("SELECT * FROM tasks WHERE task_id = ?").get(taskId);
   if (!row) return;
 
@@ -850,6 +889,9 @@ function finalizeRun(taskId, run, result) {
  */
 function dispatchNext(taskId, notifyDispatch = true) {
   if (activeRuns.has(taskId)) return false;
+  // 离线闸门：断网期间不派发（mimo 出网必卡），消息保持 pending 排队，
+  // 网络恢复后由 resumeStalledRuns 统一补派 —— 轮次不丢，事后续跑。
+  if (!networkOnline) return false;
   const msg = db
     .prepare(
       "SELECT * FROM task_messages WHERE task_id = ? AND role = 'user' AND pending = 1 ORDER BY msg_id LIMIT 1"
@@ -889,6 +931,7 @@ function dispatchNext(taskId, notifyDispatch = true) {
   }
 
   const run = runMimo({
+    taskId,
     message: withReferenceDirective(
       withArtifactDirective(msg.content, artifactDir(taskId)),
       parseAttachments(msg.attachments)
@@ -902,11 +945,64 @@ function dispatchNext(taskId, notifyDispatch = true) {
     },
   });
   activeRuns.set(taskId, run);
+  run.msgId = msg.msg_id; // 断网恢复续跑时，按此把在执行的消息重新入队
   startHeartbeat(taskId, run);
   run.done
     .then((result) => finalizeRun(taskId, run, result))
     .catch((e) => console.error("[TaskApi]", e));
   return true;
+}
+
+/**
+ * 网络恢复后的续跑入口（由 NetworkWatch 的 onOnline 回调触发）。
+ *
+ * 断网期间 mimo 的模型请求会卡住：子进程还在（activeRuns 有记录）但不再产出
+ * NDJSON 事件（runLastActivity 停滞），也永不 exit。网络恢复后给一个自愈宽限
+ * 期，若某运行仍静默超过 NET_RESUME_STALL_MS，判定为"卡死"，标记 resuming 并
+ * 杀进程组 —— finalizeRun 见 resuming 标志后不落终态，改为把在执行的消息重新
+ * 入队，再由 dispatchNext 用 --session 重发续接（见 finalizeRun 注释）。
+ *
+ * 持续产出事件的运行（正常干活、没被断网影响）不会被杀 —— 只在恢复瞬间对静默
+ * 运行生效，因此不是执行超时（不违反"任务不设超时"的既定约束）。
+ */
+function resumeStalledRuns() {
+  const now = Date.now();
+  let resumed = 0;
+  for (const [taskId, run] of activeRuns) {
+    if (run.resuming || run.canceling) continue;
+    const last = runLastActivity.get(taskId) ?? 0;
+    if (now - last < NET_RESUME_STALL_MS) continue; // 仍在产出 → 未受断网影响
+    run.resuming = true;
+    if (run.hb) clearInterval(run.hb);
+    killRunTree(run.child); // 触发 exit → finalizeRun 走 resuming 分支重新入队
+    resumed++;
+  }
+  if (resumed > 0) {
+    console.log(`[TaskApi] 网络恢复：续跑 ${resumed} 个断网卡住的运行`);
+  }
+  // 断网期间 send 排队但因无网络未派发的消息：现在统一补派
+  const pending = db
+    .prepare(
+      "SELECT DISTINCT task_id FROM task_messages WHERE role='user' AND pending=1"
+    )
+    .all();
+  for (const { task_id } of pending) {
+    if (!activeRuns.has(task_id)) dispatchNext(task_id);
+  }
+}
+
+// 网络状态改变时向所有 WS 客户端广播（relay:false —— 瞬态状态不进 task_events）
+function broadcastNetwork(online) {
+  if (wsClients.size === 0) return;
+  const buf = wsFrame(0x1, Buffer.from(JSON.stringify({
+    seq: null,
+    event: "network_status",
+    data: { online, checked_at: new Date().toISOString() },
+  })));
+  for (const s of wsClients) {
+    if (s.destroyed || !s.writable) { wsClients.delete(s); continue; }
+    try { s.write(buf); } catch { wsClients.delete(s); }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +1021,34 @@ export function mountTaskApi(app) {
   pruneTimer.unref?.();
   const stagingTimer = setInterval(() => cleanupStaging().catch(() => {}), 3600_000);
   stagingTimer.unref?.();
+
+  // 网络状态守护：离线挂起派发、恢复后对卡住的运行续跑（见 resumeStalledRuns）
+  let resumeTimer = null;
+  const netWatch = createNetworkWatcher({
+    onOffline() {
+      networkOnline = false;
+      console.log("[TaskApi] 网络离线：新消息暂缓派发，执行中的任务可能短暂无输出");
+      broadcastNetwork(false);
+    },
+    onOnline() {
+      networkOnline = true;
+      console.log("[TaskApi] 网络恢复：准备续跑断网期间卡住的任务");
+      broadcastNetwork(true);
+      // 先给在跑的进程一个自愈宽限期，再对仍静默的运行判定卡死并续跑
+      if (resumeTimer) clearTimeout(resumeTimer);
+      resumeTimer = setTimeout(() => {
+        resumeTimer = null;
+        try {
+          resumeStalledRuns();
+        } catch (e) {
+          console.error("[TaskApi] resumeStalledRuns", e);
+        }
+      }, NET_RESUME_SETTLE_MS);
+      resumeTimer.unref?.();
+    },
+  });
+  netWatch.start();
+  networkOnline = netWatch.isOnline();
 
   const router = express.Router();
   router.use(express.json());
@@ -1051,9 +1175,39 @@ export function mountTaskApi(app) {
       .all(...args, limit, offset);
 
     const names = deviceNames(rows.flatMap((r) => [r.source_device_id, r.target_device_id]));
+
+    // 卡片左下角要显示"当前轮对话"：批量取每个任务最新一条消息（running 时即本轮输入）
+    const latest = new Map();
+    if (rows.length) {
+      const ids = rows.map((r) => r.task_id);
+      const ph = ids.map(() => "?").join(",");
+      const msgRows = db
+        .prepare(
+          "SELECT task_id, msg_id, role, content, pending FROM task_messages " +
+            `WHERE msg_id IN (SELECT MAX(msg_id) FROM task_messages WHERE task_id IN (${ph}) GROUP BY task_id)`
+        )
+        .all(...ids);
+      for (const m of msgRows) latest.set(m.task_id, m);
+    }
+
     return ok(res, {
       stats,
-      tasks: rows.map((r) => rowToApi(r, names)),
+      tasks: rows.map((r) => {
+        const m = latest.get(r.task_id);
+        // 列表只作预览，超长内容截断，避免整页响应被长回答撑大
+        const content = m && m.content.length > 200 ? m.content.slice(0, 200) + "…" : m?.content;
+        return {
+          ...rowToApi(r, names),
+          current_round: m
+            ? {
+                msg_id: formatMsgId(m.msg_id),
+                role: m.role,
+                content,
+                pending: !!m.pending,
+              }
+            : null,
+        };
+      }),
       pagination: { total, page, limit, has_more: offset + rows.length < total },
       // 快照水位：客户端加载完列表后以此为 since 连 WS，重放恰好覆盖加载后的事件
       server_seq: maxEventSeq(),
@@ -1108,12 +1262,13 @@ export function mountTaskApi(app) {
         e.message
       );
     }
-    insertMsg(taskId, "user", message, null, 0, attachments);
+    const createMsgId = insertMsg(taskId, "user", message, null, 0, attachments);
 
     const workdir = cwd || resDir;
 
     // 同步 spawn，之后立刻进入等待——cancel 路由依赖 activeRuns 里的 child 句柄
     const run = runMimo({
+      taskId,
       message: withReferenceDirective(withArtifactDirective(message, resDir), attachments),
       model,
       cwd: workdir,
@@ -1126,6 +1281,7 @@ export function mountTaskApi(app) {
       },
     });
     activeRuns.set(taskId, run);
+    run.msgId = createMsgId; // 断网恢复续跑时，按此把在执行的消息重新入队
 
     const sid = await Promise.race([run.sidPromise, run.done.then(() => run.sid)]);
 
