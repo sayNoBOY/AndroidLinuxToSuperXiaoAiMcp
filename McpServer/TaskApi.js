@@ -212,9 +212,18 @@ function ensureTaskTables() {
   `);
   // 文档 POST body 有 cwd/model 但表结构缺列（见文件头差异说明 2）；
   // pending = send 排队标记（1 = 已受理未派发给 mimo）；
-  // attachments = 该条消息携带的参考物 JSON [{filename,size}]
-  ensureColumns("tasks", { cwd: "TEXT", model: "TEXT" });
+  // attachments = 该条消息携带的参考物 JSON [{filename,size}]；
+  // updated_at = 任务最近活动时间（send/派发/完成/取消时刷新，列表按它排序）
+  ensureColumns("tasks", { cwd: "TEXT", model: "TEXT", updated_at: "TEXT" });
   ensureColumns("task_messages", { pending: "INTEGER DEFAULT 0", attachments: "TEXT" });
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(user_id, updated_at DESC)"
+  );
+  // 存量行回填：完成/开始/创建时间里取最近的语义近似
+  db.exec(
+    "UPDATE tasks SET updated_at = COALESCE(completed_at, started_at, created_at) " +
+      "WHERE updated_at IS NULL"
+  );
   mkdirSync(TASK_RES_DIR, { recursive: true });
   mkdirSync(UPLOAD_STAGING_DIR, { recursive: true });
   cleanupStaging().catch(() => {}); // 上次进程退出留下的未消费批次
@@ -285,6 +294,13 @@ function deviceNames(userIds) {
 
 const deviceObj = (id, names) => (id == null ? null : { device_id: id, name: names.get(id) ?? null });
 
+/** 刷新任务更新时间（send 受理 / 派发新轮次 / 取消时调用，驱动列表排序） */
+function touchTask(taskId) {
+  db.prepare(
+    "UPDATE tasks SET updated_at = datetime('now', 'localtime') WHERE task_id = ?"
+  ).run(taskId);
+}
+
 function rowToApi(row, names, { detail = false } = {}) {
   const out = {
     task_id: row.task_id,
@@ -302,6 +318,7 @@ function rowToApi(row, names, { detail = false } = {}) {
     source_device: deviceObj(row.source_device_id, names),
     target_device: deviceObj(row.target_device_id, names),
     created_at: toISO(row.created_at),
+    updated_at: toISO(row.updated_at ?? row.created_at),
   };
   if (detail) {
     out.message = row.message ?? null;
@@ -801,7 +818,8 @@ function finalizeRun(taskId, run, result) {
   const progress = success ? 100 : row.progress ?? 0;
 
   db.prepare(
-    "UPDATE tasks SET state=?, progress=?, error_message=?, completed_at=?, duration_sec=?, session_id=? WHERE task_id=?"
+    "UPDATE tasks SET state=?, progress=?, error_message=?, completed_at=?, duration_sec=?, session_id=?, " +
+      "updated_at=datetime('now', 'localtime') WHERE task_id=?"
   ).run(newState, progress, success ? null : detail, nowNaive, duration, result.sid || row.session_id, taskId);
 
   broadcast("task_state_changed", {
@@ -844,7 +862,8 @@ function dispatchNext(taskId, notifyDispatch = true) {
   if (row.state !== "running") {
     const nowNaive = new Date().toISOString().slice(0, 19).replace("T", " ");
     db.prepare(
-      "UPDATE tasks SET state='running', progress=0, error_message=NULL, completed_at=NULL, started_at=? WHERE task_id=?"
+      "UPDATE tasks SET state='running', progress=0, error_message=NULL, completed_at=NULL, started_at=?, " +
+        "updated_at=datetime('now', 'localtime') WHERE task_id=?"
     ).run(nowNaive, taskId);
     broadcast("task_state_changed", {
       task_id: taskId,
@@ -853,6 +872,7 @@ function dispatchNext(taskId, notifyDispatch = true) {
       progress: 0,
     });
   }
+  touchTask(taskId); // 新一轮开始 = 任务更新，驱动列表按更新时间冒泡
   // 排队中标记翻转为已派发 —— 各端按 msg_id upsert
   if (notifyDispatch) {
     broadcast("task_message", {
@@ -1025,7 +1045,7 @@ export function mountTaskApi(app) {
     const args = state ? [userId, state] : [userId];
     const total = db.prepare(`SELECT COUNT(*) AS c FROM tasks ${where}`).get(...args).c;
     const rows = db
-      .prepare(`SELECT * FROM tasks ${where} ORDER BY task_id DESC LIMIT ? OFFSET ?`)
+      .prepare(`SELECT * FROM tasks ${where} ORDER BY COALESCE(updated_at, created_at) DESC, task_id DESC LIMIT ? OFFSET ?`)
       .all(...args, limit, offset);
 
     const names = deviceNames(rows.flatMap((r) => [r.source_device_id, r.target_device_id]));
@@ -1061,8 +1081,8 @@ export function mountTaskApi(app) {
     const taskId = Number(
       db
         .prepare(
-          "INSERT INTO tasks (user_id, name, icon, type, state, progress, message, source_device_id, target_device_id, cwd, model) " +
-            "VALUES (?, ?, ?, 'mimocode', 'queued', 0, ?, ?, ?, ?, ?)"
+          "INSERT INTO tasks (user_id, name, icon, type, state, progress, message, source_device_id, target_device_id, cwd, model, updated_at) " +
+            "VALUES (?, ?, ?, 'mimocode', 'queued', 0, ?, ?, ?, ?, ?, datetime('now', 'localtime'))"
         )
         .run(req.user.user_id, name, icon, message, srcId, tgtId, cwd, model).lastInsertRowid
     );
@@ -1205,6 +1225,7 @@ export function mountTaskApi(app) {
 
     const wasBusy = activeRuns.has(taskId);
     const userMsgId = insertMsg(taskId, "user", content, null, 1, attachments); // 先排队
+    touchTask(taskId); // 继续会话即刷新更新时间（列表随之冒泡）
     if (!wasBusy) dispatchNext(taskId, false); // 空闲则立即派发（下面统一广播最终状态）
     const pending = !!(db.prepare("SELECT pending FROM task_messages WHERE msg_id = ?").get(userMsgId)?.pending);
     const createdAt = toISO(new Date().toISOString().slice(0, 19).replace("T", " "));
@@ -1354,7 +1375,8 @@ export function mountTaskApi(app) {
     const nowNaive = new Date().toISOString().slice(0, 19).replace("T", " ");
     const duration = sinceSec(row.started_at || row.created_at);
     db.prepare(
-      "UPDATE tasks SET state='cancelled', completed_at=?, duration_sec=?, error_message=NULL WHERE task_id=?"
+      "UPDATE tasks SET state='cancelled', completed_at=?, duration_sec=?, error_message=NULL, " +
+        "updated_at=datetime('now', 'localtime') WHERE task_id=?"
     ).run(nowNaive, duration, taskId);
     broadcast("task_state_changed", {
       task_id: taskId,

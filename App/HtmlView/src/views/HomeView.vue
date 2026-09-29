@@ -48,6 +48,9 @@ const msgsBox = ref(null)
 // 产物预览（应用内全屏层，带返回按钮 —— 不再开新标签页）
 const previewArt = ref(null)
 
+// 消息全文弹窗（消息记录里长回复只显示 2 行，点击行查看全部）
+const fullMsg = ref(null)
+
 // Toast
 const toastMsg = ref('')
 let toastTimer = null
@@ -89,18 +92,10 @@ const queuePos = computed(() => {
   return m
 })
 
-// 展示顺序与原型一致：执行中 → 排队中 → 失败 → 已取消 → 已完成
-const primary = computed(() => {
-  const run = tasks.value.filter((t) => t.state === 'running')
-  const fail = tasks.value.filter((t) => t.state === 'failed')
-  const cancel = tasks.value.filter((t) => t.state === 'cancelled')
-  const done = tasks.value.filter((t) => t.state === 'completed')
-  return [...run, ...queueTasks.value, ...fail, ...cancel, ...done]
-})
-
-// 统计卡选中 → 只看该状态；未选中 → 全部
+// 列表顺序 = API 的更新时间倒序（send 受理 / 新轮次派发 / 完成 / 取消都会刷新
+// updated_at，继续会话后任务自动冒泡到顶部），不再按状态分组
 const visibleTasks = computed(() =>
-  statFilter.value ? tasks.value.filter((t) => t.state === statFilter.value) : primary.value
+  statFilter.value ? tasks.value.filter((t) => t.state === statFilter.value) : tasks.value
 )
 
 function startText(t) {
@@ -112,6 +107,18 @@ function durText(t) {
   if (t.state === 'queued') return '排队中'
   const s = t.duration_sec ?? 0
   return `${p2(Math.floor(s / 60))}:${p2(s % 60)}`
+}
+
+function createdText(t) {
+  return t.created_at ? t.created_at.slice(5, 16).replace('T', ' ') : '—'
+}
+
+/** 卡片副行：创建时间（必有）+ 开始时间（跑过才有）+ 耗时/排队状态 */
+function subText(t) {
+  const parts = [`${createdText(t)} 创建`]
+  if (t.started_at) parts.push(`开始 ${startText(t)}`)
+  parts.push(`耗时 ${durText(t)}`)
+  return parts.join(' · ')
 }
 
 // ---------- 操作 ----------
@@ -227,7 +234,8 @@ async function refreshDetail() {
 
 function scrollMsgs() {
   nextTick(() => {
-    const el = msgsBox.value
+    // 滚动容器是弹窗的 .sheet-scroll（消息区本身不滚，跟随整页滚到底）
+    const el = msgsBox.value?.closest('.sheet-scroll') || msgsBox.value
     if (el) el.scrollTop = el.scrollHeight
   })
 }
@@ -280,7 +288,9 @@ function closePreview() {
   previewArt.value = null
 }
 function onKeydown(e) {
-  if (e.key === 'Escape' && previewArt.value) closePreview()
+  if (e.key !== 'Escape') return
+  if (previewArt.value) return closePreview()
+  if (fullMsg.value) fullMsg.value = null // 消息全文弹窗（详情弹窗本身不随 Esc 关）
 }
 
 // ---------- 参考物选择 ----------
@@ -418,7 +428,7 @@ onUnmounted(() => {
             <div class="task-ic">{{ t.icon || '📌' }}</div>
             <div class="task-main">
               <div class="task-name">{{ t.name }}</div>
-              <div class="task-sub">{{ startText(t) }} · 耗时 {{ durText(t) }}</div>
+              <div class="task-sub">{{ subText(t) }}</div>
             </div>
             <div class="task-st">
               <span v-if="t.state === 'running'" class="st blue"
@@ -430,12 +440,6 @@ onUnmounted(() => {
               <span v-else-if="t.state === 'completed'" class="st green">✓ 已完成</span>
               <span v-else-if="t.state === 'failed'" class="st red">✕ 失败</span>
               <span v-else class="st red">✕ 已取消</span>
-            </div>
-          </div>
-
-          <div v-if="t.state === 'running'" class="task-bar">
-            <div class="pbar" style="height: 6px">
-              <div :style="{ width: (t.progress || 0) + '%', background: 'var(--blue)' }"></div>
             </div>
           </div>
 
@@ -546,121 +550,132 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 任务详情弹窗 -->
+    <!-- 任务详情弹窗：标题行 + 可滚动内容 + 底部固定「继续对话」 -->
     <div class="overlay" :class="{ show: detailOpen }" @click.self="detailOpen = false">
-      <div class="sheet">
-        <h3>任务详情</h3>
+      <div class="sheet sheet--detail">
+        <div class="sheet-head">
+          <h3>任务详情</h3>
+          <button class="close-x" aria-label="关闭" title="关闭" @click="detailOpen = false">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
+          </button>
+        </div>
         <div v-if="detailLoading" class="center muted" style="padding: 20px 0">加载中…</div>
         <template v-else-if="detailTask">
-          <div class="detail-head">
-            <div class="task-ic">{{ detailTask.icon || '📌' }}</div>
-            <div style="flex: 1; min-width: 0">
-              <div class="task-name">{{ detailTask.name }}</div>
-              <div class="task-sub">{{ startText(detailTask) }} · 耗时 {{ durText(detailTask) }}</div>
+          <div class="sheet-scroll">
+            <div class="detail-head">
+              <div class="task-ic">{{ detailTask.icon || '📌' }}</div>
+              <div style="flex: 1; min-width: 0">
+                <div class="task-name">{{ detailTask.name }}</div>
+                <div class="task-sub">{{ startText(detailTask) }} · 耗时 {{ durText(detailTask) }}</div>
+              </div>
+              <span
+                class="st"
+                :class="{ blue: detailTask.state === 'running', gray: detailTask.state === 'queued', green: detailTask.state === 'completed', red: detailTask.state === 'failed' || detailTask.state === 'cancelled' }"
+              >
+                {{ { running: '执行中', queued: '排队中', completed: '✓ 已完成', failed: '✕ 失败', cancelled: '✕ 已取消' }[detailTask.state] }}
+              </span>
             </div>
-            <span
-              class="st"
-              :class="{ blue: detailTask.state === 'running', gray: detailTask.state === 'queued', green: detailTask.state === 'completed', red: detailTask.state === 'failed' || detailTask.state === 'cancelled' }"
-            >
-              {{ { running: '执行中', queued: '排队中', completed: '✓ 已完成', failed: '✕ 失败', cancelled: '✕ 已取消' }[detailTask.state] }}
-            </span>
-          </div>
-          <div class="kv"><span class="k">任务 ID</span><span class="v">{{ detailTask.task_id }}</span></div>
-          <div class="kv"><span class="k">会话 ID</span><span class="v mono">{{ detailTask.session_id || '—' }}</span></div>
-          <div v-if="detailTask.error_message" class="kv">
-            <span class="k">错误信息</span><span class="v" style="color: var(--red)">{{ detailTask.error_message }}</span>
-          </div>
-          <div class="kv"><span class="k">任务指令</span><span class="v" style="max-width: 65%; text-align: right">{{ detailTask.message || '—' }}</span></div>
+            <div class="kv"><span class="k">任务 ID</span><span class="v">{{ detailTask.task_id }}</span></div>
+            <div class="kv"><span class="k">会话 ID</span><span class="v mono">{{ detailTask.session_id || '—' }}</span></div>
+            <div v-if="detailTask.error_message" class="kv">
+              <span class="k">错误信息</span><span class="v" style="color: var(--red)">{{ detailTask.error_message }}</span>
+            </div>
+            <div class="kv"><span class="k">任务指令</span><span class="v" style="max-width: 65%; text-align: right">{{ detailTask.message || '—' }}</span></div>
 
-          <div class="detail-sub">消息记录</div>
-          <div v-if="!detailMsgs.length" class="center muted" style="padding: 10px 0">暂无消息</div>
-          <div v-else ref="msgsBox" class="msgs">
-            <div v-for="m in detailMsgs" :key="m.msg_id" class="msg-row" :class="m.role">
-              <span class="msg-role">{{ m.role === 'user' ? '我' : 'MiMoCode' }}</span>
-              <span class="msg-content">{{ m.content }}</span>
-              <span v-if="m.pending" class="st gray pending-tag">排队中</span>
-              <div v-if="m.attachments?.length" class="msg-atts">
-                <button
-                  v-for="a in m.attachments"
-                  :key="a.filename"
-                  class="att-chip"
-                  type="button"
-                  :title="'点击查看：' + a.filename"
-                  @click="openAtt(a)"
-                >
-                  📎 {{ a.filename }}<span>{{ fmtSize(a.size) }}</span>
-                </button>
+            <div class="detail-sub">消息记录</div>
+            <div v-if="!detailMsgs.length" class="center muted" style="padding: 10px 0">暂无消息</div>
+            <div v-else ref="msgsBox" class="msgs">
+              <div
+                v-for="m in detailMsgs"
+                :key="m.msg_id"
+                class="msg-row"
+                :class="m.role"
+                :title="'点击查看完整内容'"
+                @click="fullMsg = m"
+              >
+                <span class="msg-role">{{ m.role === 'user' ? '我' : 'MiMoCode' }}</span>
+                <span class="msg-content">{{ m.content }}</span>
+                <span v-if="m.pending" class="st gray pending-tag">排队中</span>
+                <div v-if="m.attachments?.length" class="msg-atts">
+                  <button
+                    v-for="a in m.attachments"
+                    :key="a.filename"
+                    class="att-chip"
+                    type="button"
+                    :title="'点击查看：' + a.filename"
+                    @click.stop="openAtt(a)"
+                  >
+                    📎 {{ a.filename }}<span>{{ fmtSize(a.size) }}</span>
+                  </button>
+                </div>
+              </div>
+              <div v-if="detailTask.state === 'running'" class="muted" style="padding: 8px 0 0 76px">
+                MiMoCode 执行中，回复会在完成后出现…
               </div>
             </div>
-            <div v-if="detailTask.state === 'running'" class="muted" style="padding: 8px 0 0 76px">
-              MiMoCode 执行中，回复会在完成后出现…
+
+            <!-- 产物：列表 + 在线预览 / 下载 -->
+            <div class="detail-sub">
+              产物 <span v-if="detailArtifacts.length" class="muted">({{ detailArtifacts.length }})</span>
+            </div>
+            <div v-if="!detailArtifacts.length" class="center muted" style="padding: 6px 0">
+              暂无产物文件
+            </div>
+            <div v-for="a in detailArtifacts" :key="a.artifact_id" class="art-row">
+              <span class="art-name" :title="a.rel_path">{{ a.filename }}</span>
+              <span class="art-size">{{ fmtSize(a.size) }}</span>
+              <button
+                v-if="isPreviewable(a.filename)"
+                class="btn sm line"
+                @click="openPreview(a)"
+              >预览</button>
+              <a
+                class="btn sm green"
+                :href="artifactUrl(detailTask.task_id, a.artifact_id)"
+                download
+              >下载</a>
             </div>
           </div>
 
-          <!-- 多轮：继续对话（执行中发送会自动排队） -->
-          <div class="detail-sub">继续对话</div>
-          <div class="send-row">
+          <!-- 底部固定：继续对话（执行中发送会自动排队） -->
+          <div class="sheet-foot">
+            <div class="send-row">
+              <input
+                v-model="sendText"
+                class="input"
+                placeholder="发送新消息（执行中将排队等待）"
+                :disabled="sending"
+                @keydown.enter.prevent="onSend"
+              />
+              <button
+                class="btn primary"
+                :disabled="sending || !sendText.trim()"
+                @click="onSend"
+              >
+                {{ sending ? (upPct != null ? `${upPct}%` : '…') : '发送' }}
+              </button>
+            </div>
+            <div class="attach-row">
+              <button class="btn sm line" type="button" :disabled="sending" @click="sendFileEl?.click()">
+                📎 添加参考物
+              </button>
+              <span class="muted">最多 {{ MAX_FILES }} 个 · 单个 ≤50MB</span>
+            </div>
+            <div v-if="sendFiles.length" class="file-chips">
+              <span v-for="(f, i) in sendFiles" :key="f.name + i" class="chip">
+                {{ f.name }}<em>{{ fmtSize(f.size) }}</em>
+                <button class="chip-x" type="button" @click="removeSendFile(i)">×</button>
+              </span>
+            </div>
             <input
-              v-model="sendText"
-              class="input"
-              placeholder="发送新消息（执行中将排队等待）"
+              ref="sendFileEl"
+              type="file"
+              multiple
+              hidden
               :disabled="sending"
-              @keydown.enter.prevent="onSend"
+              @change="pickSendFiles"
             />
-            <button
-              class="btn primary"
-              :disabled="sending || !sendText.trim()"
-              @click="onSend"
-            >
-              {{ sending ? (upPct != null ? `${upPct}%` : '…') : '发送' }}
-            </button>
           </div>
-          <div class="attach-row">
-            <button class="btn sm line" type="button" :disabled="sending" @click="sendFileEl?.click()">
-              📎 添加参考物
-            </button>
-            <span class="muted">最多 {{ MAX_FILES }} 个 · 单个 ≤50MB</span>
-          </div>
-          <div v-if="sendFiles.length" class="file-chips">
-            <span v-for="(f, i) in sendFiles" :key="f.name + i" class="chip">
-              {{ f.name }}<em>{{ fmtSize(f.size) }}</em>
-              <button class="chip-x" type="button" @click="removeSendFile(i)">×</button>
-            </span>
-          </div>
-          <input
-            ref="sendFileEl"
-            type="file"
-            multiple
-            hidden
-            :disabled="sending"
-            @change="pickSendFiles"
-          />
-
-          <!-- 产物：列表 + 在线预览 / 下载 -->
-          <div class="detail-sub">
-            产物 <span v-if="detailArtifacts.length" class="muted">({{ detailArtifacts.length }})</span>
-          </div>
-          <div v-if="!detailArtifacts.length" class="center muted" style="padding: 6px 0">
-            暂无产物文件
-          </div>
-          <div v-for="a in detailArtifacts" :key="a.artifact_id" class="art-row">
-            <span class="art-name" :title="a.rel_path">{{ a.filename }}</span>
-            <span class="art-size">{{ fmtSize(a.size) }}</span>
-            <button
-              v-if="isPreviewable(a.filename)"
-              class="btn sm line"
-              @click="openPreview(a)"
-            >预览</button>
-            <a
-              class="btn sm green"
-              :href="artifactUrl(detailTask.task_id, a.artifact_id)"
-              download
-            >下载</a>
-          </div>
-
-          <button class="btn line" style="width: 100%; justify-content: center; margin-top: 14px" @click="detailOpen = false">
-            关闭
-          </button>
         </template>
       </div>
     </div>
@@ -686,6 +701,33 @@ onUnmounted(() => {
           ></iframe>
         </div>
       </template>
+    </div>
+
+    <!-- 消息全文弹窗：点击消息行弹出（z 60 — 高于详情 50，低于产物预览 70） -->
+    <div class="overlay msg-overlay" :class="{ show: !!fullMsg }" @click.self="fullMsg = null">
+      <div v-if="fullMsg" class="sheet msg-sheet">
+        <div class="sheet-head">
+          <h3>{{ fullMsg.role === 'user' ? '我' : 'MiMoCode' }}</h3>
+          <button class="close-x" aria-label="关闭" @click="fullMsg = null">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
+          </button>
+        </div>
+        <div class="msg-full-meta muted">
+          发送时间 {{ fullMsg.created_at?.slice(0, 19).replace('T', ' ') }}
+        </div>
+        <div class="msg-full-body">{{ fullMsg.content }}</div>
+        <div v-if="fullMsg.attachments?.length" class="msg-atts" style="padding-left: 0">
+          <button
+            v-for="a in fullMsg.attachments"
+            :key="a.filename"
+            class="att-chip"
+            type="button"
+            @click.stop="openAtt(a)"
+          >
+            📎 {{ a.filename }}<span>{{ fmtSize(a.size) }}</span>
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -754,10 +796,6 @@ onUnmounted(() => {
 .pulse { animation: pulse 1.2s infinite }
 @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.35 } }
 
-/* ===== 进度条 ===== */
-.pbar { height: 8px; background: #1e293b; border-radius: 6px; overflow: hidden }
-.pbar > div { height: 100%; border-radius: 6px; transition: width 0.5s ease }
-
 /* ===== 统计 ===== */
 .stats { display: flex; gap: 10px; margin-bottom: 14px }
 .stat {
@@ -780,7 +818,6 @@ onUnmounted(() => {
 .task-name { font-size: 14px; font-weight: 600; color: var(--t1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
 .task-sub { font-size: 11px; color: var(--t3); margin-top: 2px }
 .task-st { text-align: right }
-.task-bar { margin-top: 10px }
 .task-ops { display: flex; gap: 8px; margin-top: 10px; justify-content: flex-end }
 
 /* ===== 底部导航 ===== */
@@ -811,6 +848,35 @@ onUnmounted(() => {
 .overlay.show .sheet { transform: translateY(0) }
 .sheet h3 { font-size: 16px; font-weight: 700; margin-bottom: 14px; color: var(--t1) }
 
+/* 任务详情弹窗：标题行 + 滚动内容 + 底部固定「继续对话」 */
+.sheet--detail {
+  display: flex; flex-direction: column;
+  max-height: 88%; padding-bottom: 0; overflow: hidden;
+}
+.sheet-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; flex-shrink: 0; margin-bottom: 14px;
+}
+.sheet-head h3 { margin-bottom: 0 }
+/* 标题行右侧的关闭：圆形叉图标 */
+.close-x {
+  width: 30px; height: 30px; padding: 0; border: none; border-radius: 50%;
+  background: var(--card2); color: var(--t2); cursor: pointer;
+  display: flex; align-items: center; justify-content: center; transition: 0.15s;
+}
+.close-x:active { transform: scale(0.92) }
+.close-x svg {
+  width: 14px; height: 14px; stroke: currentColor; fill: none;
+  stroke-width: 2.2; stroke-linecap: round;
+}
+.sheet-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch }
+.sheet-foot {
+  flex-shrink: 0; background: #12192b;
+  border-top: 1px solid var(--line);
+  margin: 0 -20px; padding: 12px 20px calc(20px + env(safe-area-inset-bottom));
+  border-radius: 0 0 20px 20px;
+}
+
 /* ===== misc ===== */
 .center { text-align: center }
 .muted { color: var(--t3); font-size: 12px }
@@ -839,15 +905,20 @@ onUnmounted(() => {
 .detail-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px }
 .detail-sub { font-size: 13px; font-weight: 700; color: var(--t1); margin: 12px 0 4px }
 .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; font-weight: 400 !important }
-.msgs { max-height: 34vh; overflow-y: auto; -webkit-overflow-scrolling: touch }
 .msg-row {
   display: flex; gap: 8px; flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid var(--line);
-  font-size: 12.5px; line-height: 1.5;
+  font-size: 12.5px; line-height: 1.5; cursor: pointer; transition: background 0.15s;
 }
+.msg-row:active { background: rgba(255, 255, 255, 0.03) }
 .msg-row:last-child { border-bottom: none }
 .msg-role { flex-shrink: 0; width: 68px; color: var(--t3); font-weight: 600; font-size: 11px; padding-top: 1px }
 .msg-row.user .msg-role { color: var(--blue) }
 .msg-content { flex: 1; color: var(--t2); word-break: break-word; white-space: pre-wrap }
+/* MiMoCode 回复过长只显示 2 行，点击行弹窗看全文 */
+.msg-row.assistant .msg-content {
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; max-height: calc(2 * 1.5 * 12.5px); /* 兜底：clamp 不生效时也只占 2 行 */
+}
 .pending-tag { align-self: flex-start; flex-shrink: 0 }
 
 /* 消息附件 chips（点击复用应用内预览层） */
@@ -890,6 +961,17 @@ onUnmounted(() => {
 .art-name { flex: 1; min-width: 0; color: var(--t1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .art-size { color: var(--t3); font-size: 11px; flex-shrink: 0 }
 a.btn { text-decoration: none; justify-content: center }
+
+/* 消息全文弹窗（叠在详情之上，低于产物预览 70） */
+.msg-overlay { z-index: 60 }
+.msg-sheet { padding-bottom: 20px }
+.msg-full-meta { font-size: 11px; margin: -6px 0 10px }
+.msg-full-body {
+  font-size: 13px; line-height: 1.65; color: var(--t1); white-space: pre-wrap;
+  word-break: break-word; max-height: 50vh; overflow-y: auto;
+  -webkit-overflow-scrolling: touch; background: var(--card2);
+  border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+}
 
 /* 产物预览全屏层（z 高于详情 overlay=50，低于 toast=99） */
 .preview-overlay {
