@@ -715,7 +715,9 @@ function killRunTree(child) {
 }
 
 function runMimo({ message, session_id, model, cwd, onSessionId }) {
-  const args = ["run", message, "--format", "json"];
+  // headless 运行无人应答权限弹窗，ask 会被自动拒绝导致工具调用直接失败；
+  // 跳过在事件层自动放行，显式 deny 规则依然生效
+  const args = ["run", "--dangerously-skip-permissions", message, "--format", "json"];
   if (session_id) args.push("--session", session_id);
   if (model) args.push("-m", model);
   const workdir = cwd ? path.resolve(cwd) : os.homedir();
