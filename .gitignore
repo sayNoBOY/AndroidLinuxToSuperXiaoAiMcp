@@ -39,3 +39,4 @@ McpServer/taskRes/
 
 # Playwright test artifacts
 .playwright-cli/
+output/

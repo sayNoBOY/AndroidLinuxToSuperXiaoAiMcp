@@ -1,12 +1,12 @@
 // 轻量 hash 路由（离线环境无法安装 vue-router，接口保持相近便于日后替换）
 import { shallowRef } from 'vue'
 import LoginView from './views/LoginView.vue'
-import HomeView from './components/HelloWorld.vue'
+import HomeView from './views/HomeView.vue'
 import { getToken } from './api/auth.js'
 
 const routes = [
   { path: '/login', component: LoginView, meta: { full: true } },
-  { path: '/', component: HomeView, meta: { requiresAuth: true } },
+  { path: '/', component: HomeView, meta: { requiresAuth: true, full: true } },
 ]
 
 function resolve() {

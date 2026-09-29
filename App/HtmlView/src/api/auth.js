@@ -1,5 +1,5 @@
 // 登录认证 API — 对接 McpServer/LoginApi.js（/api/v1/auth，见《登录接口文档-v2.md》）
-const API_BASE =
+export const API_BASE =
   import.meta.env.VITE_API_BASE ||
   `http://${window.location.hostname || 'localhost'}:3000/api/v1`
 
@@ -46,7 +46,7 @@ function saveAccessToken(access_token) {
   store(rememberMe).setItem(KEY_ACCESS, access_token)
 }
 
-async function request(path, { method = 'GET', body, token } = {}) {
+export async function request(path, { method = 'GET', body, token } = {}) {
   const headers = {}
   if (body) headers['Content-Type'] = 'application/json'
   if (token) headers['Authorization'] = `Bearer ${token}`
@@ -86,7 +86,7 @@ export async function login(username, password, rememberMe) {
 }
 
 /** 用 refresh_token 换新 access_token，成功返回 true */
-async function tryRefresh() {
+export async function tryRefresh() {
   const refresh_token = getRefreshToken()
   if (!refresh_token) return false
   try {

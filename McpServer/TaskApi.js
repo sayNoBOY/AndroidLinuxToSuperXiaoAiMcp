@@ -2,18 +2,29 @@
  * 随身互联 — 任务管理接口（依据《任务管理接口文档-v2.md》实现）
  *
  *   GET    /api/v1/tasks               任务列表（含 stats + 分页，需 Bearer）
- *   POST   /api/v1/tasks               创建任务 = 创建 MiMoCode 会话（需 Bearer）
+ *   POST   /api/v1/uploads             参考物分步上传（multipart/form-data，需 Bearer）
+ *           ≤5 个/次、≤50MB/个、≤100MB/总量；手写有界解析（express.raw 先卡 110mb）。
+ *           文件暂存 taskRes/.staging/<batch_id>/（隐藏目录不入产物扫描），
+ *           由 POST /tasks 或 /send 携 upload_batch 消费迁入任务目录。
+ *   POST   /api/v1/tasks               创建任务 = 创建 MiMoCode 会话（需 Bearer，
+ *                                       可携 upload_batch 关联参考物）
  *   GET    /api/v1/tasks/{task_id}     任务详情（需 Bearer）
- *   POST   /api/v1/tasks/{task_id}/send  发送新消息，多轮续接会话（需 Bearer）
- *   GET    /api/v1/tasks/{task_id}/messages  消息历史（需 Bearer）
- *   PUT    /api/v1/tasks/{task_id}/cancel    取消任务（终止会话，需 Bearer）
+ *   POST   /api/v1/tasks/{task_id}/send  发送新消息（202 受理；运行中自动排队，
+ *                                        当前轮结束后按序续跑 —— 多轮会话，
+ *                                        可携 upload_batch 关联参考物）
+ *   GET    /api/v1/tasks/{task_id}/messages  消息历史（pending=1 为排队中）
+ *   PUT    /api/v1/tasks/{task_id}/cancel    取消任务（终止会话并丢弃排队消息，需 Bearer）
  *   DELETE /api/v1/tasks/{task_id}     删除任务（需 Bearer）
  *   DELETE /api/v1/tasks/completed     清空已完成任务（需 Bearer）
  *   GET    /api/v1/tasks/{task_id}/artifacts  产物列表（扫描 taskRes/<id>/ 并同步表记录）
  *   GET    /api/v1/tasks/{task_id}/artifacts/{artifact_id}/download
- *           下载产物（附件下载；?inline=1 时按内联预览，文件名中文自动编码）
- *   WS     /ws/tasks?token=<access_token>    实时推送（task_created / task_message /
- *                                            task_progress / task_state_changed）
+ *           下载产物（附件下载；?inline=1 按内联预览；?token= 允许无 Authorization 头）
+ *   WS     /ws/tasks?token=<access_token>&since=<seq>
+ *           实时推送 + 断联中继：事件经 task_events 表落库并带全局自增 seq，
+ *           重连时 since 补发断线期间的事件；缺失窗口已过期则推 task_resync
+ *           要求客户端全量重拉。事件：task_created / task_message /
+ *           task_state_changed / task_artifacts_changed 落库可重放；
+ *           task_progress（心跳）仅实时广播不落库。
  *
  * 产物存储：taskRes/<task_id>/（McpServer 目录下，gitignore）。每个任务一个文件夹，
  * 任务创建时建目录；未指定 cwd 的任务默认在该目录执行，并向 MiMoCode 注入
@@ -24,7 +35,10 @@
  *
  * 架构：任务 = MiMoCode 会话。创建任务时同步 spawn `mimo run --format json`，
  * 首个事件返回 session_id 后即响应 201（state=running），进程在后台继续执行，
- * 结束时落库 completed/failed 并通过 WS 推送；`send` 为同步等待回复的多轮续接。
+ * 结束时落库 completed/failed 并通过 WS 推送。多轮 = 顺序多次 `mimo run --session`：
+ * send 立即入库返回 202，若上一轮还在跑则标记 pending 排队，finalize 后自动续跑
+ * 下一条 —— 客户端断网不影响轮次执行，回复事后经消息历史/事件重放取回。
+ * 无执行超时：任务跑到多久都行，只在用户 cancel 时杀进程组。
  *
  * 数据库：SQLite（复用 LoginApi 的 getDb() 连接，库文件 data/suishen.db），
  * 首次挂载自动建表 tasks / task_messages（文档 §7）。
@@ -50,10 +64,10 @@
  */
 import path from "node:path";
 import os from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
-import { readdir, stat, mkdir, rm } from "node:fs/promises";
+import { readdir, stat, mkdir, rm, rename, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import cors from "cors";
@@ -67,8 +81,15 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TASK_RES_DIR = path.join(__dirname, "taskRes"); // 每任务一个子目录存放产物
-const RUN_TIMEOUT_MS = 300_000; // 与 McpApi 的 ask_mimocode 一致
+const UPLOAD_STAGING_DIR = path.join(TASK_RES_DIR, ".staging"); // 参考物分步上传暂存区
+const UPLOAD_MAX_FILES = 5;
+const UPLOAD_MAX_FILE_BYTES = 50 * 1024 * 1024; // 50MB/个
+const UPLOAD_MAX_TOTAL_BYTES = 100 * 1024 * 1024; // 100MB/次
+const UPLOAD_STAGING_TTL_MS = 24 * 3600_000; // 未被消费的批次 24h 后清理
 const HEARTBEAT_MS = 5_000;
+const EVENT_REPLAY_LIMIT = 500; // since 重放单次上限，超出即要求全量兜底
+const EVENT_MAX_ROWS = 2_000; // task_events 全局保留行数上限（超出从最旧删起）
+const EVENT_PRUNE_MS = 10 * 60_000;
 const ACTIVE_STATES = new Set(["queued", "running"]);
 const ALL_STATES = new Set(["queued", "running", "completed", "failed", "cancelled"]);
 
@@ -172,16 +193,31 @@ function ensureTaskTables() {
       FOREIGN KEY (task_id) REFERENCES tasks(task_id)
     );
 
+    CREATE TABLE IF NOT EXISTS task_events (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      task_id INTEGER,
+      event TEXT NOT NULL,
+      data TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now', 'localtime'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_user_state ON tasks(user_id, state);
     CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
     CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_taskmsg_task ON task_messages(task_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_taskart_task ON task_artifacts(task_id);
     CREATE UNIQUE INDEX IF NOT EXISTS uq_taskart_rel ON task_artifacts(task_id, rel_path);
+    CREATE INDEX IF NOT EXISTS idx_tev_user_seq ON task_events(user_id, seq);
   `);
-  // 文档 POST body 有 cwd/model 但表结构缺列（见文件头差异说明 2）
+  // 文档 POST body 有 cwd/model 但表结构缺列（见文件头差异说明 2）；
+  // pending = send 排队标记（1 = 已受理未派发给 mimo）；
+  // attachments = 该条消息携带的参考物 JSON [{filename,size}]
   ensureColumns("tasks", { cwd: "TEXT", model: "TEXT" });
+  ensureColumns("task_messages", { pending: "INTEGER DEFAULT 0", attachments: "TEXT" });
   mkdirSync(TASK_RES_DIR, { recursive: true });
+  mkdirSync(UPLOAD_STAGING_DIR, { recursive: true });
+  cleanupStaging().catch(() => {}); // 上次进程退出留下的未消费批次
 
   hasDevices = !!db
     .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='devices'")
@@ -193,6 +229,9 @@ function ensureTaskTables() {
       "completed_at=datetime('now','localtime') WHERE state IN ('queued','running')"
   ).run();
   if (stale.changes > 0) console.log(`[TaskApi] 已将 ${stale.changes} 个中断任务标记为失败`);
+  // 没有任何运行能在重启后存活，排队中的消息一并作废（不留无法派发的 pending）
+  const orphanQ = db.prepare("UPDATE task_messages SET pending=0 WHERE pending=1").run();
+  if (orphanQ.changes > 0) console.log(`[TaskApi] 已丢弃 ${orphanQ.changes} 条重启前排队消息`);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,12 +248,20 @@ function parseMsgRef(v) {
   return m ? Number(m[1]) : null;
 }
 
-function insertMsg(taskId, role, content, mimocodeMsgId = null) {
+function insertMsg(taskId, role, content, mimocodeMsgId = null, pending = 0, attachments = null) {
   const r = db
     .prepare(
-      "INSERT INTO task_messages (task_id, role, content, mimocode_msg_id) VALUES (?, ?, ?, ?)"
+      "INSERT INTO task_messages (task_id, role, content, mimocode_msg_id, pending, attachments) " +
+        "VALUES (?, ?, ?, ?, ?, ?)"
     )
-    .run(taskId, role, content, mimocodeMsgId);
+    .run(
+      taskId,
+      role,
+      content,
+      mimocodeMsgId,
+      pending ? 1 : 0,
+      attachments?.length ? JSON.stringify(attachments) : null
+    );
   return Number(r.lastInsertRowid);
 }
 
@@ -295,6 +342,7 @@ async function syncArtifacts(taskId) {
   const seen = new Set();
   const nowNaive = new Date().toISOString().slice(0, 19).replace("T", " ");
   const out = [];
+  let changed = false;
 
   for (const rel of names) {
     // 跳过隐藏项：MiMoCode 自身状态（cwd 下的 .mimocode/ 等）不算产物
@@ -325,9 +373,11 @@ async function syncArtifacts(taskId) {
         size: st.size,
         created_at: nowNaive,
       };
+      changed = true;
     } else if (rec.size !== st.size) {
       db.prepare("UPDATE task_artifacts SET size = ? WHERE artifact_id = ?").run(st.size, rec.artifact_id);
       rec = { ...rec, size: st.size };
+      changed = true;
     }
     out.push(rec);
   }
@@ -337,8 +387,13 @@ async function syncArtifacts(taskId) {
     db
       .prepare(`DELETE FROM task_artifacts WHERE artifact_id IN (${gone.map(() => "?").join(",")})`)
       .run(...gone.map((r) => r.artifact_id));
+    changed = true;
   }
   out.sort((a, b) => a.rel_path.localeCompare(b.rel_path));
+  if (changed) {
+    // 产物有增删改：通知各端刷新详情里的产物列表（重连可重放）
+    broadcast("task_artifacts_changed", { task_id: taskId, total: out.length });
+  }
   return out;
 }
 
@@ -357,7 +412,161 @@ function withArtifactDirective(message, dir) {
 }
 
 // ---------------------------------------------------------------------------
+// 参考物上传：手写 multipart 解析 + .staging 批次（分步上传的前半段）
+// 离线装不了 busboy/multer；请求体已先被 express.raw 限制在上限内，
+// 这里只做有界的 Buffer 切分（按 --boundary 定位），不做流式。
+// ---------------------------------------------------------------------------
+
+/** 文件名清洗：取 basename、剥路径成分/控制符/前导点、限长；空则回退 "file" */
+function sanitizeFilename(raw) {
+  let base = path.basename(String(raw ?? "").replace(/\\/g, "/"));
+  // eslint-disable-next-line no-control-regex
+  base = base.replace(/[\x00-\x1f\x7f]/g, "").replace(/^\.+/, "").trim();
+  if (!base) return "file";
+  if (base.length > 120) {
+    const ext = path.extname(base).slice(0, 16);
+    base = base.slice(0, 120 - ext.length) + ext;
+  }
+  return base;
+}
+
+/**
+ * 解析 multipart/form-data（手写有界实现）。
+ * 结构：preamble --boundary CRLF headers CRLF CRLF body CRLF --boundary … --boundary--
+ * body 内部出现分隔串由协议保证不可能（boundary 由客户端选出）。
+ * 返回 [{ name, filename, body(Buffer) }]；文件字段 filename 为空的按普通字段。
+ */
+function parseMultipart(buf, contentType) {
+  const bm = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType || "");
+  const boundary = (bm?.[1] ?? bm?.[2] ?? "").trim();
+  if (!boundary) throw new Error("缺少 multipart boundary");
+  const delim = Buffer.from(`--${boundary}`);
+  const out = [];
+  let pos = buf.indexOf(delim);
+  if (pos < 0) throw new Error("未找到 multipart 分隔符");
+
+  while (pos >= 0) {
+    let start = pos + delim.length;
+    if (buf[start] === 0x2d && buf[start + 1] === 0x2d) break; // "--" 结束标记
+    if (buf[start] === 0x0d && buf[start + 1] === 0x0a) start += 2; // CRLF
+    const next = buf.indexOf(delim, start);
+    if (next < 0) break;
+    let end = next;
+    if (buf[end - 2] === 0x0d && buf[end - 1] === 0x0a) end -= 2; // part 尾 CRLF
+    const part = buf.subarray(start, end);
+    const headEnd = part.indexOf("\r\n\r\n");
+    if (headEnd >= 0) {
+      const head = part.subarray(0, headEnd).toString("utf8");
+      const body = part.subarray(headEnd + 4);
+      const cd = /content-disposition:[^\r\n]*/i.exec(head)?.[0] ?? "";
+      const name = /;\s*name="([^"]*)"/i.exec(cd)?.[1] ?? null;
+      let filename = /filename\*=(?:UTF-8'')?([^;\r\n]+)/i.exec(cd)?.[1];
+      if (filename) {
+        try {
+          filename = decodeURIComponent(filename.trim());
+        } catch {
+          filename = filename.trim();
+        }
+      } else {
+        filename = /filename="([^"]*)"/i.exec(cd)?.[1] ?? null;
+      }
+      out.push({ name, filename, body });
+    }
+    pos = next;
+  }
+  return out;
+}
+
+/** 清理 24h 未被消费的暂存批次（启动时 + 周期跑） */
+async function cleanupStaging() {
+  let names = [];
+  try {
+    names = await readdir(UPLOAD_STAGING_DIR);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - UPLOAD_STAGING_TTL_MS;
+  for (const n of names) {
+    const dir = path.join(UPLOAD_STAGING_DIR, n);
+    try {
+      const st = await stat(dir);
+      if (st.mtimeMs < cutoff) await rm(dir, { recursive: true, force: true });
+    } catch {
+      /* 已消失 */
+    }
+  }
+}
+
+/**
+ * 消费暂存批次：把 .staging/<batchId>/ 里的文件迁入任务目录（重名加序号），
+ * 删除批次目录。返回 [{filename,size}]（迁移后的最终文件名）。
+ * batchId 非空但批次不存在 → 返回 null（调用方 404）；不存在迁移冲突以外的错误上抛。
+ */
+async function consumeBatch(taskId, batchId) {
+  if (!batchId) return [];
+  const id = String(batchId);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    throw Object.assign(new Error("upload_batch 格式无效"), { status: 400 });
+  }
+  const src = path.join(UPLOAD_STAGING_DIR, id);
+  const dst = artifactDir(taskId);
+  let names;
+  try {
+    names = await readdir(src);
+  } catch {
+    throw Object.assign(new Error("上传批次不存在或已过期"), { status: 404 });
+  }
+  await mkdir(dst, { recursive: true });
+  const moved = [];
+  const used = new Set(
+    (await readdir(dst).catch(() => [])).map((n) => n.toLowerCase())
+  );
+  for (const n of names) {
+    const from = path.join(src, n);
+    if ((await stat(from)).isDirectory()) continue;
+    // 重名 → "name (1).ext" 式顺延，绝不覆盖已有文件
+    let target = n;
+    let stem = path.parse(n).name;
+    const { ext } = path.parse(n);
+    let k = 1;
+    while (used.has(target.toLowerCase())) target = `${stem} (${k++})${ext}`;
+    used.add(target.toLowerCase());
+    // staging 与任务目录同在 taskRes/ 下（同盘），rename 即原子迁入
+    await rename(from, path.join(dst, target));
+    moved.push({ filename: target, size: (await stat(path.join(dst, target))).size });
+  }
+  await rm(src, { recursive: true, force: true });
+  return moved;
+}
+
+// 给 mimo 的指令追加参考文件清单（只拼 spawn 的指令，存储的用户消息保持原文）
+function withReferenceDirective(message, attachments) {
+  if (!attachments?.length) return message;
+  const names = attachments.map((a) => a.filename).join("、");
+  return (
+    `${message}\n\n[系统约束] 本轮参考文件已放在工作目录：${names}。` +
+    `请先阅读其内容，再结合执行任务。`
+  );
+}
+
+function parseAttachments(json) {
+  if (!json) return null;
+  try {
+    const v = JSON.parse(json);
+    return Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket 客户端集合与事件广播（attachTaskWs 建立连接，路由只管发）
+//
+// 断联中继：relay 事件先写 task_events 拿全局自增 seq，再以 {seq,event,data}
+// 帧广播；客户端记住 lastSeq，重连时 ?since=lastSeq 补发漏掉的事件。
+// 保留窗口只剪最旧（全局连续），重连端校验 since 是否已跌出窗口 ——
+// 跌出则推 task_resync，客户端全量重拉兜底。task_progress 心跳高频且瞬态，
+// relay:false 只实时广播不落库（seq 为 null，客户端不推进 lastSeq）。
 // ---------------------------------------------------------------------------
 
 const wsClients = new Set();
@@ -381,9 +590,29 @@ function wsFrame(opcode, payload) {
   return Buffer.concat([header, payload]);
 }
 
-function broadcast(event, data) {
+function wsSend(socket, obj) {
+  try {
+    socket.write(wsFrame(0x1, Buffer.from(JSON.stringify(obj))));
+  } catch {
+    wsClients.delete(socket);
+  }
+}
+
+function broadcast(event, data, { relay = true } = {}) {
+  let seq = null;
+  if (relay) {
+    const taskId = data?.task_id ?? null;
+    const owner =
+      taskId != null ? db.prepare("SELECT user_id FROM tasks WHERE task_id = ?").get(taskId) : null;
+    if (owner) {
+      const r = db
+        .prepare("INSERT INTO task_events (user_id, task_id, event, data) VALUES (?, ?, ?, ?)")
+        .run(owner.user_id, taskId, event, JSON.stringify(data));
+      seq = Number(r.lastInsertRowid);
+    }
+  }
   if (wsClients.size === 0) return;
-  const buf = wsFrame(0x1, Buffer.from(JSON.stringify({ event, data })));
+  const buf = wsFrame(0x1, Buffer.from(JSON.stringify({ seq, event, data })));
   for (const s of wsClients) {
     if (s.destroyed || !s.writable) {
       wsClients.delete(s);
@@ -397,6 +626,48 @@ function broadcast(event, data) {
   }
 }
 
+/** 当前事件水位（快照一致性：列表/详情返回 server_seq，客户端 since 从这里接） */
+function maxEventSeq() {
+  const r = db.prepare("SELECT MAX(seq) AS m FROM task_events").get();
+  return r?.m ?? 0;
+}
+
+/**
+ * 重连补发：since 之后属于该用户的事件。返回 "replayed"（含 since 缺省的空操作）、
+ * "resync"（since 已跌出保留窗口/事件过多，客户端须全量重拉）。
+ */
+function replayEvents(socket, userId, since) {
+  if (since == null) return "replayed";
+  const min = db.prepare("SELECT MIN(seq) AS m FROM task_events").get()?.m ?? null;
+  // 缺口判定：表空但客户端自称见过事件 → 丢了；min 跳过了 since+1 → 中间被修剪。
+  // since=0 且表空 = 客户端从未见过且服务端确实没有 → 一致，无需 resync。
+  const gap = min == null ? since > 0 : min > since + 1;
+  if (gap) {
+    wsSend(socket, { seq: null, event: "task_resync", data: { reason: "gap" } });
+    return "resync";
+  }
+  const rows = db
+    .prepare(
+      "SELECT seq, event, data FROM task_events WHERE user_id = ? AND seq > ? ORDER BY seq LIMIT ?"
+    )
+    .all(userId, since, EVENT_REPLAY_LIMIT + 1);
+  if (rows.length > EVENT_REPLAY_LIMIT) {
+    wsSend(socket, { seq: null, event: "task_resync", data: { reason: "window" } });
+    return "resync";
+  }
+  for (const r of rows) {
+    wsSend(socket, { seq: r.seq, event: r.event, data: JSON.parse(r.data) });
+  }
+  return "replayed";
+}
+
+/** 保留窗口修剪：只留最新 EVENT_MAX_ROWS 行（连续尾部，故 since 校验依然成立） */
+function pruneEvents() {
+  db.prepare(
+    "DELETE FROM task_events WHERE seq <= COALESCE((SELECT seq FROM task_events ORDER BY seq DESC LIMIT 1 OFFSET ?), -1)"
+  ).run(EVENT_MAX_ROWS);
+}
+
 // ---------------------------------------------------------------------------
 // MiMoCode 运行器：spawn `mimo run --format json`，增量解析 NDJSON 事件流
 // ---------------------------------------------------------------------------
@@ -405,20 +676,45 @@ function broadcast(event, data) {
 // 终态处理器见此标志后不再写库/广播。
 const activeRuns = new Map();
 
+/**
+ * 杀掉一次运行的整个进程组。
+ *
+ * `mimo` 只是个启动器：它用 spawnSync({ stdio: "inherit" }) 拉起真正的 `.mimocode`，
+ * 两者 pid 不同。只杀启动器会留下孤儿 agent 继续跑（占 CPU、可能还在写产物）。
+ *
+ * spawn 传了 detached:true，child.pid 即新进程组 id，`kill(-pid)` 可一并带走。
+ * 仅供用户主动 cancel/删除/进程退出时使用 —— 任务本身没有执行超时。
+ */
+function killRunTree(child) {
+  const pid = child?.pid;
+  if (!pid) return;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch (e) {
+    // ESRCH = 整个进程组已退出（多半已被取消/超时杀过），无需处理；
+    // 此函数跑在 setTimeout 回调里，任何异常都不能抛出去
+    if (e.code !== "ESRCH") console.error("[TaskApi] killRunTree", e.message);
+  }
+}
+
 function runMimo({ message, session_id, model, cwd, onSessionId }) {
   const args = ["run", message, "--format", "json"];
   if (session_id) args.push("--session", session_id);
   if (model) args.push("-m", model);
   const workdir = cwd ? path.resolve(cwd) : os.homedir();
 
-  const child = spawn("mimo", args, { cwd: workdir, stdio: ["ignore", "pipe", "pipe"] });
+  // detached: 子进程自成进程组，否则 kill(-pid) 会误伤服务器自己所在的组
+  const child = spawn("mimo", args, {
+    cwd: workdir,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
+  });
 
   let sid = session_id ?? null;
   let resolveSid;
   const sidPromise = new Promise((r) => (resolveSid = r));
   const texts = [];
   let stderr = "";
-  let timedOut = false;
   let buf = "";
 
   const parseLine = (line) => {
@@ -448,17 +744,15 @@ function runMimo({ message, session_id, model, cwd, onSessionId }) {
   child.stderr.on("data", (d) => (stderr += d));
 
   const done = new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, RUN_TIMEOUT_MS);
     const settle = (error, code) => {
-      clearTimeout(timer);
       if (buf.trim()) parseLine(buf.trim());
       resolveSid(sid); // 未拿到 session_id 时以 null 结束创建流程
-      resolve({ sid, texts, stderr, timedOut, code, error });
+      resolve({ sid, texts, stderr, code, error });
     };
-    child.on("close", (code) => {
+    // 监听 exit 而非 close：close 还要求 stdio 管道全部关闭，而 mimo 拉起的
+    // 孙进程（如截图用的 chromium、playwright 守护进程）会继承 stdout 拖住
+    // close 数百秒 —— 进程退出即视为本轮结束，残余 buffer 此刻一并冲掉。
+    child.on("exit", (code) => {
       settle(code === 0 ? null : new Error(`exit code ${code}`), code);
     });
     child.on("error", (err) => settle(err, null));
@@ -475,15 +769,16 @@ function startHeartbeat(taskId, run) {
       task_id: taskId,
       progress: row.progress ?? 0,
       duration_sec: sinceSec(row.started_at || row.created_at),
-    });
+    }, { relay: false }); // 心跳瞬态高频：只实时广播，不进 task_events
   }, HEARTBEAT_MS);
   run.hb.unref?.();
 }
 
 /**
  * 运行结束的统一收尾：清心跳与活动表 → 若是取消则由 cancel 路由负责（跳过）→
- * 落库终态（completed/failed）+ 存 assistant 消息 + 广播状态变更与回复。
- * 创建流程在拿到 session_id 后挂接；send 流程 await done 后主动调用。
+ * 落库终态（completed/failed）+ 存 assistant 消息 + 广播状态变更与回复 →
+ * 最后调 dispatchNext 续跑队列里的下一条消息。
+ * 创建流程在拿到 session_id 后挂接；send 流程由 dispatchNext 派发时挂接。
  */
 function finalizeRun(taskId, run, result) {
   if (run.hb) clearInterval(run.hb);
@@ -493,12 +788,10 @@ function finalizeRun(taskId, run, result) {
   if (!row) return;
 
   const answer = result.texts.join("\n").trim();
-  const detail = result.timedOut
-    ? "执行超时（300 秒）"
-    : result.error
-      ? `${result.error.message}${result.stderr ? "；" + result.stderr.slice(0, 300) : ""}`
-      : "";
-  const success = !result.timedOut && !(result.error && !answer);
+  const detail = result.error
+    ? `${result.error.message}${result.stderr ? "；" + result.stderr.slice(0, 300) : ""}`
+    : "";
+  const success = !(result.error && !answer);
   const content = success ? answer || "(无文本输出)" : `执行失败：${detail || "未知错误"}`;
   const msgId = insertMsg(taskId, "assistant", content);
 
@@ -521,9 +814,77 @@ function finalizeRun(taskId, run, result) {
   broadcast("task_message", {
     task_id: taskId,
     msg_id: formatMsgId(msgId),
+    role: "assistant",
     content,
+    pending: false,
     created_at: toISO(nowNaive),
   });
+
+  dispatchNext(taskId); // 队列非空则立刻开下一轮（state 回到 running）
+}
+
+/**
+ * 派发该任务排队最早的 pending 用户消息。activeRuns 非空（上一轮还在跑）时
+ * 什么都不做 —— 那一轮的 finalize 会再次调进来。同步执行，无 await 竞态。
+ * notifyDispatch=false：调用方（send 立即派发）自己统一广播，避免重复事件。
+ */
+function dispatchNext(taskId, notifyDispatch = true) {
+  if (activeRuns.has(taskId)) return false;
+  const msg = db
+    .prepare(
+      "SELECT * FROM task_messages WHERE task_id = ? AND role = 'user' AND pending = 1 ORDER BY msg_id LIMIT 1"
+    )
+    .get(taskId);
+  if (!msg) return false;
+  db.prepare("UPDATE task_messages SET pending = 0 WHERE msg_id = ?").run(msg.msg_id);
+
+  const row = db.prepare("SELECT * FROM tasks WHERE task_id = ?").get(taskId);
+  if (!row || !row.session_id) return false; // 会话不存在：消息已消费但无法续跑
+
+  if (row.state !== "running") {
+    const nowNaive = new Date().toISOString().slice(0, 19).replace("T", " ");
+    db.prepare(
+      "UPDATE tasks SET state='running', progress=0, error_message=NULL, completed_at=NULL, started_at=? WHERE task_id=?"
+    ).run(nowNaive, taskId);
+    broadcast("task_state_changed", {
+      task_id: taskId,
+      old_state: row.state,
+      new_state: "running",
+      progress: 0,
+    });
+  }
+  // 排队中标记翻转为已派发 —— 各端按 msg_id upsert
+  if (notifyDispatch) {
+    broadcast("task_message", {
+      task_id: taskId,
+      msg_id: formatMsgId(msg.msg_id),
+      role: "user",
+      content: msg.content,
+      pending: false,
+      attachments: parseAttachments(msg.attachments),
+      created_at: toISO(msg.created_at),
+    });
+  }
+
+  const run = runMimo({
+    message: withReferenceDirective(
+      withArtifactDirective(msg.content, artifactDir(taskId)),
+      parseAttachments(msg.attachments)
+    ),
+    session_id: row.session_id,
+    model: row.model,
+    cwd: row.cwd || artifactDir(taskId),
+    onSessionId(sid) {
+      if (sid !== row.session_id)
+        db.prepare("UPDATE tasks SET session_id=? WHERE task_id=?").run(sid, taskId);
+    },
+  });
+  activeRuns.set(taskId, run);
+  startHeartbeat(taskId, run);
+  run.done
+    .then((result) => finalizeRun(taskId, run, result))
+    .catch((e) => console.error("[TaskApi]", e));
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +899,11 @@ const asInt = (v) => {
 export function mountTaskApi(app) {
   ensureTaskTables();
 
+  const pruneTimer = setInterval(pruneEvents, EVENT_PRUNE_MS);
+  pruneTimer.unref?.();
+  const stagingTimer = setInterval(() => cleanupStaging().catch(() => {}), 3600_000);
+  stagingTimer.unref?.();
+
   const router = express.Router();
   router.use(express.json());
   router.use(
@@ -546,6 +912,91 @@ export function mountTaskApi(app) {
       methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
       allowedHeaders: ["Authorization", "Content-Type"],
     })
+  );
+
+  // 产物下载/预览常被 <a href> / <img src> 直连（带不了 Authorization 头），
+  // 该路由允许 ?token=<access_token> 兜底；其余路由仍只认 Bearer 头
+  const requireAuthOrToken = (req, res, next) => {
+    if (!req.headers.authorization && req.query.token) {
+      verifyAccessToken(String(req.query.token), req.app.locals.loginSecret)
+        .then((r) => {
+          req.auth = r.payload;
+          req.user = r.user;
+          next();
+        })
+        .catch((e) => {
+          if (e.api) fail(res, e.api.status, e.api.message, e.api.type, e.api.detail);
+          else next(e);
+        });
+      return;
+    }
+    return requireAuth(req, res, next);
+  };
+
+  // POST /api/v1/uploads —— 参考物分步上传（前半段：只入 .staging 拿 batch_id）
+  // multipart 手写解析：先 express.raw 把请求体卡在 110mb（>100MB 数据+边框开销），
+  // 再按 boundary 切 Buffer —— 离线环境无 busboy/multer，且量级可控（局域网）。
+  router.post(
+    "/uploads",
+    requireAuth,
+    express.raw({ type: "multipart/form-data", limit: "110mb" }),
+    async (req, res) => {
+      const ct = req.headers["content-type"] || "";
+      if (!/^multipart\/form-data/i.test(ct)) {
+        return badRequest(res, "请以 multipart/form-data 上传");
+      }
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        return badRequest(res, "请求体为空");
+      }
+      let parts;
+      try {
+        parts = parseMultipart(req.body, ct);
+      } catch (e) {
+        return fail(res, 400, "multipart 解析失败", "MULTIPART_INVALID", e.message);
+      }
+      const files = parts.filter((p) => p.filename && p.body?.length);
+      if (!files.length) return badRequest(res, "未包含文件字段");
+      if (files.length > UPLOAD_MAX_FILES) {
+        return fail(res, 400, `单次最多上传 ${UPLOAD_MAX_FILES} 个文件`, "LIMIT_FILE_COUNT");
+      }
+      let total = 0;
+      for (const f of files) {
+        if (f.body.length > UPLOAD_MAX_FILE_BYTES) {
+          return fail(
+            res,
+            413,
+            `文件 ${sanitizeFilename(f.filename)} 超过 ${UPLOAD_MAX_FILE_BYTES / 1024 / 1024}MB 限制`,
+            "LIMIT_FILE_SIZE"
+          );
+        }
+        total += f.body.length;
+      }
+      if (total > UPLOAD_MAX_TOTAL_BYTES) {
+        return fail(res, 413, "本次上传总量超过 100MB", "LIMIT_TOTAL_SIZE");
+      }
+
+      const batchId = randomUUID();
+      const dir = path.join(UPLOAD_STAGING_DIR, batchId);
+      await mkdir(dir, { recursive: true });
+      const used = new Set();
+      try {
+        const saved = [];
+        for (const f of files) {
+          let name = sanitizeFilename(f.filename);
+          const { ext } = path.parse(name);
+          const stem = path.parse(name).name;
+          let k = 1;
+          while (used.has(name.toLowerCase())) name = `${stem} (${k++})${ext}`;
+          used.add(name.toLowerCase());
+          await writeFile(path.join(dir, name), f.body);
+          saved.push({ filename: name, size: f.body.length });
+        }
+        return ok(res, { batch_id: batchId, files: saved }, 201);
+      } catch (e) {
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        throw e;
+      }
+    }
   );
 
   // GET /api/v1/tasks —— 列表（stats + 状态筛选 + 分页）
@@ -582,6 +1033,8 @@ export function mountTaskApi(app) {
       stats,
       tasks: rows.map((r) => rowToApi(r, names)),
       pagination: { total, page, limit, has_more: offset + rows.length < total },
+      // 快照水位：客户端加载完列表后以此为 since 连 WS，重放恰好覆盖加载后的事件
+      server_seq: maxEventSeq(),
     });
   });
 
@@ -602,6 +1055,8 @@ export function mountTaskApi(app) {
     const message = b.message;
     const cwd = typeof b.cwd === "string" && b.cwd ? b.cwd : null;
     const model = typeof b.model === "string" && b.model ? b.model : null;
+    const uploadBatch =
+      typeof b.upload_batch === "string" && b.upload_batch ? b.upload_batch : null;
 
     const taskId = Number(
       db
@@ -611,16 +1066,33 @@ export function mountTaskApi(app) {
         )
         .run(req.user.user_id, name, icon, message, srcId, tgtId, cwd, model).lastInsertRowid
     );
-    insertMsg(taskId, "user", message);
 
     // 每任务一个产物目录；未指定 cwd 时默认在此执行（目录必存在）
     const resDir = artifactDir(taskId);
     await mkdir(resDir, { recursive: true });
+
+    // 参考物批次迁入任务目录（必须先落盘，spawn 后 mimo 才能读到）
+    let attachments;
+    try {
+      attachments = await consumeBatch(taskId, uploadBatch);
+    } catch (e) {
+      db.prepare("DELETE FROM tasks WHERE task_id = ? AND state = 'queued'").run(taskId);
+      await removeTaskArtifacts(taskId);
+      return fail(
+        res,
+        e.status ?? 500,
+        e.status ? e.message : "参考物落盘失败",
+        e.status ? "UPLOAD_BATCH_INVALID" : "UPLOAD_FAILED",
+        e.message
+      );
+    }
+    insertMsg(taskId, "user", message, null, 0, attachments);
+
     const workdir = cwd || resDir;
 
     // 同步 spawn，之后立刻进入等待——cancel 路由依赖 activeRuns 里的 child 句柄
     const run = runMimo({
-      message: withArtifactDirective(message, resDir),
+      message: withReferenceDirective(withArtifactDirective(message, resDir), attachments),
       model,
       cwd: workdir,
       onSessionId(sid) {
@@ -636,11 +1108,14 @@ export function mountTaskApi(app) {
     const sid = await Promise.race([run.sidPromise, run.done.then(() => run.sid)]);
 
     if (!sid) {
-      // 创建失败：删除 queued 记录（若已被取消则保留 cancelled 行），返回文档格式的 500
+      // 创建失败：删除 queued 记录（若已被取消则保留 cancelled 行），返回文档格式的 500；
+      // 连带清掉消息与任务目录（含刚迁入的参考物），不留孤儿
       const result = await run.done;
       if (run.hb) clearInterval(run.hb);
       activeRuns.delete(taskId);
       db.prepare("DELETE FROM tasks WHERE task_id = ? AND state = 'queued'").run(taskId);
+      db.prepare("DELETE FROM task_messages WHERE task_id = ?").run(taskId);
+      await removeTaskArtifacts(taskId);
       const detail =
         result.error
           ? `${result.error.message}${result.stderr ? "；" + result.stderr.slice(0, 300) : ""}`
@@ -691,68 +1166,74 @@ export function mountTaskApi(app) {
     const row = getOwnedTask(taskId, req.user.user_id);
     if (!row) return fail(res, 404, "任务不存在", "TASK_NOT_FOUND");
     const names = deviceNames([row.source_device_id, row.target_device_id]);
-    return ok(res, rowToApi(row, names, { detail: true }));
+    return ok(res, { ...rowToApi(row, names, { detail: true }), server_seq: maxEventSeq() });
   });
 
-  // POST /api/v1/tasks/{task_id}/send —— 多轮续接，同步等待回复
+  // POST /api/v1/tasks/{task_id}/send —— 多轮续接（202 受理，不等本轮跑完）
+  // 上一轮仍在执行 → 消息置 pending 排队，finalize 后按序自动续跑；
+  // 空闲 → 立即派发。两种情况都 202 返回，客户端断网也不丢轮次，
+  // 回复经 GET messages / WS task_message（重连可重放）取回。
   router.post("/tasks/:taskId/send", requireAuth, async (req, res) => {
     const taskId = asInt(req.params.taskId);
     if (taskId == null) return badRequest(res, "task_id 无效");
     const content = req.body?.content;
     if (typeof content !== "string" || !content.trim()) return badRequest(res, "content 为必填字段");
+    const uploadBatch =
+      typeof req.body?.upload_batch === "string" && req.body.upload_batch
+        ? req.body.upload_batch
+        : null;
 
     const row = getOwnedTask(taskId, req.user.user_id);
     if (!row) return fail(res, 404, "任务不存在", "TASK_NOT_FOUND");
     if (!row.session_id) return fail(res, 409, "任务尚未创建会话", "TASK_NO_SESSION");
-    if (activeRuns.has(taskId)) return fail(res, 409, "任务正在执行中", "SESSION_BUSY");
 
-    const userMsgId = insertMsg(taskId, "user", content);
-    const nowNaive = new Date().toISOString().slice(0, 19).replace("T", " ");
-    db.prepare(
-      "UPDATE tasks SET state='running', progress=0, error_message=NULL, started_at=? WHERE task_id=?"
-    ).run(nowNaive, taskId);
-
-    const run = runMimo({
-      message: withArtifactDirective(content, artifactDir(taskId)),
-      session_id: row.session_id,
-      model: row.model,
-      cwd: row.cwd || artifactDir(taskId),
-      onSessionId(sid) {
-        // 正常应沿用原会话；若 MiMoCode 返回了新会话则更新指向
-        if (sid !== row.session_id) db.prepare("UPDATE tasks SET session_id=? WHERE task_id=?").run(sid, taskId);
-      },
-    });
-    activeRuns.set(taskId, run);
-
-    let result;
-    try {
-      result = await run.done;
-    } finally {
-      if (run.hb) clearInterval(run.hb);
+    // 参考物先迁入任务目录再入库排队（派发时 mimo 在 cwd 即可读到）
+    let attachments = null;
+    if (uploadBatch) {
+      try {
+        attachments = await consumeBatch(taskId, uploadBatch);
+      } catch (e) {
+        return fail(
+          res,
+          e.status ?? 500,
+          e.status ? e.message : "参考物落盘失败",
+          e.status ? "UPLOAD_BATCH_INVALID" : "UPLOAD_FAILED",
+          e.message
+        );
+      }
     }
-    finalizeRun(taskId, run, result);
+
+    const wasBusy = activeRuns.has(taskId);
+    const userMsgId = insertMsg(taskId, "user", content, null, 1, attachments); // 先排队
+    if (!wasBusy) dispatchNext(taskId, false); // 空闲则立即派发（下面统一广播最终状态）
+    const pending = !!(db.prepare("SELECT pending FROM task_messages WHERE msg_id = ?").get(userMsgId)?.pending);
+    const createdAt = toISO(new Date().toISOString().slice(0, 19).replace("T", " "));
+    broadcast("task_message", {
+      task_id: taskId,
+      msg_id: formatMsgId(userMsgId),
+      role: "user",
+      content,
+      pending,
+      attachments,
+      created_at: createdAt,
+    });
 
     const after = db.prepare("SELECT * FROM tasks WHERE task_id = ?").get(taskId);
-    const answer = result.texts.join("\n").trim();
-    const failed = result.timedOut || (result.error && !answer);
-    if (failed || !after) {
-      const detail = result.timedOut
-        ? "执行超时（300 秒）"
-        : `${result.error?.message ?? "未知错误"}${result.stderr ? "；" + result.stderr.slice(0, 300) : ""}`;
-      return fail(res, 500, "消息发送失败", "SEND_FAILED", detail);
-    }
-
-    const msgs = db
-      .prepare("SELECT * FROM task_messages WHERE task_id = ? ORDER BY msg_id DESC LIMIT 2")
-      .all(taskId)
-      .reverse(); // 升序：[user, assistant]
-    const pick = (m) => ({ msg_id: formatMsgId(m.msg_id), content: m.content, created_at: toISO(m.created_at) });
-    return ok(res, {
-      task_id: taskId,
-      session_id: after.session_id,
-      user_message: pick(msgs.find((m) => m.msg_id === userMsgId) ?? msgs[0]),
-      assistant_message: pick(msgs.at(-1)),
-    });
+    return ok(
+      res,
+      {
+        task_id: taskId,
+        msg_id: formatMsgId(userMsgId),
+        role: "user",
+        content,
+        pending,
+        session_id: after?.session_id ?? row.session_id,
+        state: after?.state ?? "running",
+        attachments,
+        created_at: createdAt,
+      },
+      202
+    );
   });
 
   // GET /api/v1/tasks/{task_id}/messages —— 消息历史（before 向前翻页）
@@ -793,6 +1274,8 @@ export function mountTaskApi(app) {
           msg_id: formatMsgId(m.msg_id),
           role: m.role,
           content: m.content,
+          pending: !!m.pending, // 1 = 已受理、还没派发给 mimo 的排队消息
+          attachments: parseAttachments(m.attachments), // [{filename,size}] 参考物
           created_at: toISO(m.created_at),
         })),
       has_more: hasMore,
@@ -821,8 +1304,8 @@ export function mountTaskApi(app) {
     });
   });
 
-  // GET /api/v1/tasks/{task_id}/artifacts/{artifact_id}/download —— 下载（?inline=1 预览）
-  router.get("/tasks/:taskId/artifacts/:artifactId/download", requireAuth, async (req, res) => {
+  // GET /api/v1/tasks/{task_id}/artifacts/{artifact_id}/download —— 下载（?inline=1 预览，?token= 兜底认证）
+  router.get("/tasks/:taskId/artifacts/:artifactId/download", requireAuthOrToken, async (req, res) => {
     const taskId = asInt(req.params.taskId);
     const artifactId = asInt(req.params.artifactId);
     if (taskId == null || artifactId == null) return badRequest(res, "id 无效");
@@ -864,8 +1347,10 @@ export function mountTaskApi(app) {
     if (entry) {
       entry.canceling = true; // finalizeRun 见此标志后跳过写库/广播
       if (entry.hb) clearInterval(entry.hb);
-      entry.child.kill("SIGKILL");
+      killRunTree(entry.child);
     }
+    // 排队消息永远不会跑：删除，避免任务已取消却残留 pending
+    db.prepare("DELETE FROM task_messages WHERE task_id = ? AND pending = 1").run(taskId);
     const nowNaive = new Date().toISOString().slice(0, 19).replace("T", " ");
     const duration = sinceSec(row.started_at || row.created_at);
     db.prepare(
@@ -893,7 +1378,7 @@ export function mountTaskApi(app) {
     if (entry) {
       entry.canceling = true;
       if (entry.hb) clearInterval(entry.hb);
-      entry.child.kill("SIGKILL");
+      killRunTree(entry.child);
       activeRuns.delete(taskId);
     }
     db.prepare("DELETE FROM task_messages WHERE task_id = ?").run(taskId);
@@ -904,10 +1389,31 @@ export function mountTaskApi(app) {
 
   router.use((err, req, res, _next) => {
     console.error("[TaskApi]", err);
-    if (!res.headersSent) fail(res, 500, "服务器内部错误", "INTERNAL_ERROR");
+    if (res.headersSent) return;
+    if (
+      err?.status === 413 ||
+      err?.type === "request.too.large" ||
+      err?.type === "entity.too.large"
+    ) {
+      return fail(res, 413, "请求体超过限制", "PAYLOAD_TOO_LARGE");
+    }
+    fail(res, 500, "服务器内部错误", "INTERNAL_ERROR");
   });
 
   app.use("/api/v1", router);
+
+  // detached 让子进程自成进程组（否则 kill(-pid) 会连服务器一起杀），
+  // 代价是 Ctrl-C 不再顺带带走它们——退出前自行收尾，别留孤儿 agent
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    process.once(sig, () => {
+      for (const run of activeRuns.values()) {
+        if (run.hb) clearInterval(run.hb);
+        killRunTree(run.child);
+      }
+      process.exit(sig === "SIGINT" ? 130 : 143);
+    });
+  }
+
   return { db };
 }
 
@@ -1000,10 +1506,14 @@ export function attachTaskWs(server) {
 
     const token = url.searchParams.get("token");
     if (!token) return rejectUpgrade(socket, 401, "missing token");
+    // 断联中继：客户端带上自己已收到的最大 seq，握手后补发其错过的事件；
+    // since 缺省（首次连接）不重放 —— 客户端在加载快照时已拿到 server_seq
+    const sinceRaw = url.searchParams.get("since");
+    const since = sinceRaw != null && /^\d+$/.test(sinceRaw) ? Number(sinceRaw) : null;
 
     // 认证与 HTTP 路由同一套校验（签名/类型/吊销/用户存在）
     verifyAccessToken(token)
-      .then(() => {
+      .then(({ user }) => {
         const key = req.headers["sec-websocket-key"];
         if (!key) return rejectUpgrade(socket, 400);
         const accept = createHash("sha1").update(key + WS_GUID).digest("base64");
@@ -1021,7 +1531,10 @@ export function attachTaskWs(server) {
         const drop = () => wsClients.delete(socket);
         socket.on("close", drop);
         socket.on("error", drop);
+        // 先入列再重放（同 tick 内无交错）：重放期间广播的新事件会带着更大的
+        // seq 直达本连接，客户端按 lastSeq 去重即可
         wsClients.add(socket);
+        replayEvents(socket, user.user_id, since);
       })
       .catch(() => rejectUpgrade(socket, 401, "invalid token"));
   });
