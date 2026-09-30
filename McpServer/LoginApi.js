@@ -21,6 +21,7 @@ import { DatabaseSync } from "node:sqlite";
 import { SignJWT, jwtVerify } from "jose";
 import express from "express";
 import cors from "cors";
+import { mountOperationLog } from "./OpLog.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -465,6 +466,7 @@ const isMain =
   process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   const app = express();
+  mountOperationLog(app); // 全局操作日志（必须先于业务路由）
   mountLoginApi(app);
   const PORT = Number(process.env.PORT) || 3000;
   app.listen(PORT, "0.0.0.0", () => {

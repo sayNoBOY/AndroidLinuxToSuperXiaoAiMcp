@@ -171,6 +171,8 @@ function rebootWaitActive() {
 /**
  * 等服务回来：restart.sh 连 vite 一起重启，本页很可能被整页刷新（组件状态丢失），
  * 所以 ① 等待状态存 sessionStorage 供重载后续接；② 期间的轮询错误全部静默。
+ * 假成功修复：重启窗口内旧进程也是 HTTP 200（state=restarting），
+ * 只有新进程真正 running 才算回来 —— 否则会瞬间弹"已完成"且过早清掉续等标记。
  */
 async function waitServerBack() {
   rebooting.value = true
@@ -180,6 +182,10 @@ async function waitServerBack() {
       await loadStatus()
     } catch {
       await sleep(1000)
+      continue
+    }
+    if (status.value?.state !== 'running') {
+      await sleep(1000) // 旧进程还没死透/新进程没就绪：继续等
       continue
     }
     rebooting.value = false

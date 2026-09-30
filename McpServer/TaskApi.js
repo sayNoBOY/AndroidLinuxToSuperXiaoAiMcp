@@ -78,6 +78,7 @@ import {
   isPrivateOrigin,
   mountLoginApi,
 } from "./LoginApi.js";
+import { mountOperationLog } from "./OpLog.js";
 import { createNetworkWatcher } from "./NetworkWatch.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -240,15 +241,9 @@ function ensureTaskTables() {
     .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='devices'")
     .get();
 
-  // 上次进程退出时残留的活跃任务：子进程已不在，标记失败避免永远"执行中"
-  const stale = db.prepare(
-    "UPDATE tasks SET state='failed', error_message='服务重启导致任务中断', " +
-      "completed_at=datetime('now','localtime') WHERE state IN ('queued','running')"
-  ).run();
-  if (stale.changes > 0) console.log(`[TaskApi] 已将 ${stale.changes} 个中断任务标记为失败`);
-  // 没有任何运行能在重启后存活，排队中的消息一并作废（不留无法派发的 pending）
-  const orphanQ = db.prepare("UPDATE task_messages SET pending=0 WHERE pending=1").run();
-  if (orphanQ.changes > 0) console.log(`[TaskApi] 已丢弃 ${orphanQ.changes} 条重启前排队消息`);
+  // 上次进程退出时残留的活跃任务 → 重启自恢复（重新入队 + --session 续跑），
+  // 而非一律标失败 —— 见 recoverInterruptedTasks()
+  recoverInterruptedTasks();
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +302,63 @@ function touchTask(taskId) {
   db.prepare(
     "UPDATE tasks SET updated_at = datetime('now', 'localtime') WHERE task_id = ?"
   ).run(taskId);
+}
+
+// 重启恢复：先在建表阶段收集，等 mountTaskApi 里 netWatch 就绪后统一派发
+const recoveredTaskIds = [];
+
+/**
+ * 服务重启自恢复（替代"残留活跃任务一律标失败"）：
+ *  - 有 session_id 且存在未完成轮次（没有任何 assistant 回复排在其后的 user 消息，
+ *    含重启前已在跑的那条和原排队的）→ 全部重新置 pending、state 回 queued，
+ *    由 dispatchNext 用 --session 重发原消息续跑（断网则 pending 保留，
+ *    网络恢复后 resumeStalledRuns 补派 —— 与断网恢复同一条实测路径）；
+ *  - 无 session_id（会话未建起来）→ 无法续接，维持旧策略标失败；
+ *  - 活跃态但回复已全部入库（finalize 未及执行）→ 直接判完成。
+ */
+function recoverInterruptedTasks() {
+  const rows = db
+    .prepare("SELECT task_id, session_id FROM tasks WHERE state IN ('queued','running')")
+    .all();
+  for (const t of rows) {
+    if (!t.session_id) {
+      db.prepare(
+        "UPDATE tasks SET state='failed', error_message='服务重启导致任务中断（无会话，无法续跑）', " +
+          "completed_at=datetime('now','localtime') WHERE task_id=?"
+      ).run(t.task_id);
+      db.prepare("UPDATE task_messages SET pending=0 WHERE task_id=? AND pending=1").run(t.task_id);
+      continue;
+    }
+    const openMsgs = db
+      .prepare(
+        "SELECT msg_id, pending FROM task_messages WHERE task_id = ? AND role = 'user' " +
+          "AND NOT EXISTS (" +
+          "  SELECT 1 FROM task_messages a " +
+          "  WHERE a.task_id = task_messages.task_id AND a.role = 'assistant' AND a.msg_id > task_messages.msg_id" +
+          ") ORDER BY msg_id"
+      )
+      .all(t.task_id);
+    if (openMsgs.length === 0) {
+      db.prepare(
+        "UPDATE tasks SET state='completed', progress=100, error_message=NULL, " +
+          "completed_at=datetime('now','localtime') WHERE task_id=?"
+      ).run(t.task_id);
+      continue;
+    }
+    for (const m of openMsgs) {
+      if (!m.pending) db.prepare("UPDATE task_messages SET pending=1 WHERE msg_id=?").run(m.msg_id);
+    }
+    db.prepare(
+      "UPDATE tasks SET state='queued', error_message=NULL, completed_at=NULL, " +
+        "updated_at=datetime('now','localtime') WHERE task_id=?"
+    ).run(t.task_id);
+    recoveredTaskIds.push(t.task_id);
+  }
+  if (recoveredTaskIds.length > 0) {
+    console.log(
+      `[TaskApi] 重启恢复：${recoveredTaskIds.length} 个任务的中断轮次已重新排队，将用 --session 续跑`
+    );
+  }
 }
 
 function rowToApi(row, names, { detail = false } = {}) {
@@ -1050,6 +1102,9 @@ export function mountTaskApi(app) {
   netWatch.start();
   networkOnline = netWatch.isOnline();
 
+  // 重启恢复的任务：网络状态就绪后统一派发（离线则 pending 保留，网络恢复补派）
+  for (const id of recoveredTaskIds.splice(0)) dispatchNext(id);
+
   const router = express.Router();
   router.use(express.json());
   router.use(
@@ -1735,6 +1790,7 @@ const isMain =
 if (isMain) {
   const app = express();
   app.use(express.json({ limit: "512mb" }));
+  mountOperationLog(app); // 全局操作日志（必须先于业务路由）
   mountLoginApi(app);
   mountTaskApi(app);
   const PORT = Number(process.env.PORT) || 3000;

@@ -12,9 +12,8 @@
  *                                   再 spawn 脚本；新进程启动即为 running，需 Bearer）
  *
  * 数据库：SQLite（复用 LoginApi 的 getDb() 连接，库文件 data/suishen.db），唯一表 operation_log
- * （数据库文档 v1.4：实时状态不落库、活动日志已移除，只保留操作日志）。每个接口处理完成后由
- * res 'finish' 中间件统一异步写一条操作留痕（参数、业务结果码、耗时、设备/IP）；首次挂载表为空时
- * 写入数据库文档 §5 的种子数据。
+ * （数据库文档 v1.4：实时状态不落库、活动日志已移除，只保留操作日志）。建表/种子/7天清理与
+ * **全局**操作留痕中间件在 OpLog.js（覆盖登录/任务/上传/MCP/系统全部接口），本模块只做读取。
  * 实时状态：状态机与启动时间存模块内存；CPU/内存/磁盘/网络从 os、df、/proc 实时读取，不进数据库。
  *
  * 与文档的差异（均有原因）：
@@ -30,8 +29,8 @@
  *    （缺失/中途失败）由 error/exit 监听回滚为 running。
  * 3. 响应字段按文档使用 camelCase（serverId / resultCode / occurredAt …），与库列 snake_case
  *    在序列化时转换。
- * 4. 轮询接口（status/metrics/network 5~10s 一次）会持续产生操作留痕，靠 operation_log 的
- *    7 天保留策略（挂载时启动定时清理）控制体积。
+ * 4. status/metrics/network 为 10s 轮询，**不写**操作日志（OpLog 的规则表已剔除，
+ *    否则打开「我的」页日志区全是"查看服务器状态"）；留痕只覆盖查日志/重启等主动操作。
  *
  * 挂载方式：import { mountSysApi } from "./SysApi.js"; mountSysApi(app);
  * 独立运行：node SysApi.js  （会同时挂载登录接口 —— 系统接口依赖其认证）
@@ -44,13 +43,13 @@ import { readFileSync } from "node:fs";
 import express from "express";
 import cors from "cors";
 import { getDb, requireAuth, isPrivateOrigin, mountLoginApi } from "./LoginApi.js";
+import { ensureOperationLog, mountOperationLog } from "./OpLog.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const SERVER_ID = 1; // 文档：单服务器（缺省 serverId=1）
 const REBOOT_SECONDS = 10; // 文档 POST /reboot：estimatedSeconds（restart.sh 冷启动经验 6~10s）
 const RESTART_SCRIPT = path.resolve(__dirname, "..", "restart.sh"); // 仓库根目录的重启脚本
-const LOG_KEEP_DAYS = 7; // 数据库文档 §7.2：操作日志保留 7 天
 const LATENCY_TTL_MS = 5_000; // 延迟探测缓存（ping 每 5s 最多一次）
 const CPU_SAMPLE_MS = 200; // CPU 首次采样两次读取的间隔
 
@@ -283,143 +282,8 @@ function readLatencyMs() {
   return ms;
 }
 
-// ---------------------------------------------------------------------------
-// 数据库：operation_log 建表（数据库文档 §2.1）+ 7 天清理
-// ---------------------------------------------------------------------------
-
+// operation_log 的建表/种子/清理与全局留痕中间件在 OpLog.js，这里只保留读取连接
 let db = null;
-let pruneTimer = null;
-
-function ensureOperationLogTable() {
-  db = getDb();
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS operation_log (
-      op_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      request_id    TEXT,
-      server_id     INTEGER NOT NULL DEFAULT 1,
-      api_path      TEXT NOT NULL,
-      http_method   TEXT NOT NULL,
-      action        TEXT NOT NULL,
-      content       TEXT NOT NULL,
-      params        TEXT,
-      result_code   INTEGER NOT NULL,
-      result_msg    TEXT,
-      duration_ms   INTEGER NOT NULL DEFAULT 0,
-      operator      TEXT,
-      device_id     TEXT,
-      client_ip     TEXT,
-      occurred_at   TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-      created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_op_time        ON operation_log (occurred_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_op_server_time ON operation_log (server_id, occurred_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_op_api_time    ON operation_log (api_path, occurred_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_op_result      ON operation_log (result_code, occurred_at DESC);
-  `);
-
-  // 首次初始化：写入数据库文档 §5 的种子数据（页面日志区有初始内容）
-  const count = db.prepare("SELECT COUNT(*) AS n FROM operation_log").get().n;
-  if (count === 0) seedOperationLog();
-}
-
-function seedOperationLog() {
-  const rows = [
-    ["req-seed-01", "/api/v1/server/status", "GET", "查看服务器状态", "查看服务器状态成功", "{}", 0, "success", 12, "dev-seed", "192.168.1.56", "2026-09-28 09:41:22"],
-    ["req-seed-02", "/api/v1/server/metrics", "GET", "查看资源使用率", "查看资源使用率成功", "{}", 0, "success", 9, "dev-seed", "192.168.1.56", "2026-09-28 09:41:22"],
-    ["req-seed-03", "/api/v1/server/logs", "GET", "查询最近日志", "查询最近日志成功", '{"limit":5}', 0, "success", 6, "dev-seed", "192.168.1.56", "2026-09-28 09:41:23"],
-    ["req-seed-04", "/api/v1/server/reboot", "POST", "重启服务器", "重启服务器成功", '{"serverId":1,"confirm":true}', 0, "success", 86, "dev-seed", "192.168.1.56", "2026-09-28 09:42:01"],
-    ["req-seed-05", "/api/v1/server/reboot", "POST", "重启服务器", "重启服务器：重启任务已存在，重复触发", '{"serverId":1,"confirm":true}', 2003, "重启任务已存在，重复触发", 4, "dev-seed", "192.168.1.56", "2026-09-28 09:42:05"],
-  ];
-  const stmt = db.prepare(`
-    INSERT INTO operation_log
-      (request_id, server_id, api_path, http_method, action, content, params,
-       result_code, result_msg, duration_ms, device_id, client_ip, occurred_at)
-    VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  for (const r of rows) stmt.run(...r);
-}
-
-// ---------------------------------------------------------------------------
-// 操作留痕：文档业务错误码映射 + res finish 统一异步写入
-// ---------------------------------------------------------------------------
-
-const DOC_CODE_BY_TYPE = {
-  INVALID_REQUEST: 1001,
-  MISSING_TOKEN: 1002,
-  AUTH_EXPIRED: 1002,
-  AUTH_INVALID: 1002,
-  SERVER_NOT_FOUND: 2001,
-  SERVER_STATE_INVALID: 2002,
-  REBOOT_IN_PROGRESS: 2003,
-  INTERNAL_ERROR: 5000,
-};
-
-const ACTION_BY_PATH = {
-  "GET /api/v1/server/status": "查看服务器状态",
-  "GET /api/v1/server/metrics": "查看资源使用率",
-  "GET /api/v1/server/network": "查看网络信息",
-  "GET /api/v1/server/logs": "查询最近日志",
-  "GET /api/v1/server/logs/all": "查询全部日志",
-  "POST /api/v1/server/reboot": "重启服务器",
-};
-
-function docResultCode(payload, statusCode) {
-  if (statusCode >= 200 && statusCode < 300) return 0;
-  const type = payload?.error?.type;
-  if (type && DOC_CODE_BY_TYPE[type] != null) return DOC_CODE_BY_TYPE[type];
-  return payload?.code ?? statusCode;
-}
-
-function sanitizeParams(req) {
-  const src = {
-    ...(req.query && typeof req.query === "object" ? req.query : {}),
-    ...(req.body && typeof req.body === "object" ? req.body : {}),
-  };
-  const out = {};
-  for (const [k, v] of Object.entries(src)) {
-    out[k] = /pass|token|secret|auth/i.test(k) ? "***" : v;
-  }
-  return JSON.stringify(out).slice(0, 2000);
-}
-
-// 异步落库：业务响应优先，写失败只告警不影响接口（文档 §4 写入原则）
-function recordOperation(req, res, payload, durationMs) {
-  setImmediate(() => {
-    try {
-      const routePath = req.route ? (req.baseUrl || "") + (req.route.path || "") : null;
-      const key = `${req.method} ${routePath}`;
-      const action = ACTION_BY_PATH[key];
-      if (!action) return; // 未匹配业务路由的请求不记（如 404 兜底）
-
-      const success = res.statusCode >= 200 && res.statusCode < 300;
-      const message = payload?.message || payload?.error?.detail || "";
-      const content = success ? `${action}成功` : `${action}：${message || "失败"}`;
-
-      db.prepare(`
-        INSERT INTO operation_log
-          (request_id, server_id, api_path, http_method, action, content, params,
-           result_code, result_msg, duration_ms, operator, device_id, client_ip)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        req.headers["x-request-id"] || null,
-        SERVER_ID,
-        routePath,
-        req.method,
-        action,
-        content,
-        sanitizeParams(req),
-        docResultCode(payload, res.statusCode),
-        message || null,
-        durationMs,
-        req.user?.username ?? null,
-        req.headers["x-device-id"] || null,
-        req.ip || null
-      );
-    } catch (e) {
-      console.error("[SysApi] operation_log 写入失败:", e.message);
-    }
-  });
-}
 
 // ---------------------------------------------------------------------------
 // 路由（前缀 /api/v1/server，全部走 requireAuth）
@@ -446,19 +310,8 @@ function resolveServerId(raw, res) {
 }
 
 export function mountSysApi(app) {
-  ensureOperationLogTable();
-
-  // 操作日志保留 7 天（数据库文档 §7.2），每 6 小时清理一次
-  const prune = () => {
-    try {
-      db.prepare("DELETE FROM operation_log WHERE occurred_at < datetime('now', ?)").run(`-${LOG_KEEP_DAYS} days`);
-    } catch (e) {
-      console.error("[SysApi] operation_log 清理失败:", e.message);
-    }
-  };
-  prune();
-  pruneTimer = setInterval(prune, 6 * 3600_000);
-  pruneTimer.unref?.();
+  ensureOperationLog(); // 建表/种子在 OpLog；本模块随后只读
+  db = getDb();
 
   const router = express.Router();
   router.use(express.json());
@@ -469,20 +322,6 @@ export function mountSysApi(app) {
       allowedHeaders: ["Authorization", "Content-Type", "X-Device-Id", "X-Request-Id"],
     })
   );
-
-  // 统一操作留痕：路由匹配后记录本次调用（成功与失败都记，文档 §4）
-  router.use((req, res, next) => {
-    if (req.method === "OPTIONS") return next();
-    const start = Date.now();
-    const origJson = res.json.bind(res);
-    let payload = null;
-    res.json = (body) => {
-      payload = body;
-      return origJson(body);
-    };
-    res.on("finish", () => recordOperation(req, res, payload, Date.now() - start));
-    next();
-  });
 
   // GET /api/v1/server/status —— 概览状态（运行时，不落库）
   router.get("/status", requireAuth, (req, res) => {
@@ -725,6 +564,7 @@ const isMain =
 if (isMain) {
   const app = express();
   app.use(express.json());
+  mountOperationLog(app); // 全局操作日志（必须先于业务路由）
   mountLoginApi(app);
   mountSysApi(app);
   const PORT = Number(process.env.PORT) || 3000;

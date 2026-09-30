@@ -4,11 +4,13 @@ import { mountMcpApi } from "./McpApi.js";
 import { mountLoginApi } from "./LoginApi.js";
 import { mountTaskApi, attachTaskWs } from "./TaskApi.js";
 import { mountSysApi } from "./SysApi.js";
+import { mountOperationLog } from "./OpLog.js";
 
 const app = express();
 // 视频等大文件 base64 后体积更大，放宽 body 限制
 app.use(express.json({ limit: "512mb" }));
 
+mountOperationLog(app); // 全局操作日志：必须在业务路由之前挂（finish 监听）
 mountMcpApi(app);
 mountLoginApi(app);
 mountTaskApi(app);
