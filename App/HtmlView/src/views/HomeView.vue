@@ -6,6 +6,7 @@ import {
   connectTaskEvents, setEventSeq,
 } from '../api/tasks.js'
 import { MD_RE, renderMarkdown } from '../lib/markdown.js'
+import { push } from '../router.js'
 
 // 依据 随身互联开发文档/设计/随身互联App四Tab原型(6).html 首页（Tab1 任务中心）实现
 // 数据接 /api/v1/tasks，WS 实时刷新 + since 重放（断联中继）；除首页外的 Tab 仅保留视觉
@@ -586,7 +587,7 @@ onUnmounted(() => {
         <svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5"/><rect x="8" y="8" width="8" height="8" rx="2"/></svg>
         <span>设备</span>
       </div>
-      <div class="tab" @click="toast('我的页面开发中，敬请期待')">
+      <div class="tab" @click="push('/service')">
         <svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
         <span>我的</span>
       </div>

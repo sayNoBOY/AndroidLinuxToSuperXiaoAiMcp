@@ -1056,7 +1056,7 @@ export function mountTaskApi(app) {
     cors({
       origin: isPrivateOrigin,
       methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Authorization", "Content-Type"],
+      allowedHeaders: ["Authorization", "Content-Type", "X-Device-Id", "X-Request-Id"],
     })
   );
 
