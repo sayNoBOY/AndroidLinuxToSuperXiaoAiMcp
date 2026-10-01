@@ -287,6 +287,11 @@ function fmtSize(n) {
   return `${(n / 1048576).toFixed(1)} MB`
 }
 
+// 产物更新时间：API 为 +08:00 ISO，取墙上时钟 MM-DD HH:mm
+function fmtArtTime(iso) {
+  return iso ? iso.slice(5, 16).replace('T', ' ') : '—'
+}
+
 const PREVIEW_RE = /\.(png|jpe?g|gif|webp|svg|html|pdf|txt|md|json|csv)$/i
 const isPreviewable = (name) => PREVIEW_RE.test(name)
 const isImageExt = (name) => /\.(png|jpe?g|gif|webp|svg)$/i.test(name)
@@ -710,7 +715,7 @@ onUnmounted(() => {
             </div>
             <div v-for="a in detailArtifacts" :key="a.artifact_id" class="art-row">
               <span class="art-name" :title="a.rel_path">{{ a.filename }}</span>
-              <span class="art-size">{{ fmtSize(a.size) }}</span>
+              <span class="art-size" :title="a.mtime">{{ fmtArtTime(a.mtime) }} · {{ fmtSize(a.size) }}</span>
               <button
                 v-if="isPreviewable(a.filename)"
                 class="btn sm line"

@@ -403,7 +403,7 @@ function safeArtifactPath(taskId, relPath) {
 
 /**
  * 扫描任务目录并与 task_artifacts 对账：新文件登记、size 变化更新、
- * 文件已消失的记录删除。返回按路径排序的完整产物记录列表。
+ * 文件已消失的记录删除。返回按文件 mtime 倒序（最新在前）的完整产物记录列表。
  */
 async function syncArtifacts(taskId) {
   const dir = artifactDir(taskId);
@@ -456,7 +456,8 @@ async function syncArtifacts(taskId) {
       rec = { ...rec, size: st.size };
       changed = true;
     }
-    out.push(rec);
+    // 一并挂上 mtimeMs，排序与 API 响应都用它（created_at 只记首次登记）
+    out.push({ ...rec, mtimeMs: st.mtimeMs });
   }
 
   const gone = records.filter((r) => !seen.has(r.rel_path));
@@ -466,7 +467,11 @@ async function syncArtifacts(taskId) {
       .run(...gone.map((r) => r.artifact_id));
     changed = true;
   }
-  out.sort((a, b) => a.rel_path.localeCompare(b.rel_path));
+  // 最新写入在上；mtime 相同再按路径稳定排序
+  out.sort((a, b) => {
+    const d = (b.mtimeMs ?? 0) - (a.mtimeMs ?? 0);
+    return d !== 0 ? d : a.rel_path.localeCompare(b.rel_path);
+  });
   if (changed) {
     // 产物有增删改：通知各端刷新详情里的产物列表（重连可重放）
     broadcast("task_artifacts_changed", { task_id: taskId, total: out.length });
@@ -1528,12 +1533,14 @@ export function mountTaskApi(app) {
       task_id: taskId,
       dir: `taskRes/${taskId}`,
       total: artifacts.length,
+      // 已按文件 mtime 倒序（最新在前）；mtime 为文件最后写入时间
       artifacts: artifacts.map((a) => ({
         artifact_id: a.artifact_id,
         filename: a.filename,
         rel_path: a.rel_path,
         size: a.size,
         created_at: toISO(a.created_at),
+        mtime: a.mtimeMs != null ? toISO(new Date(a.mtimeMs).toISOString().slice(0, 19).replace("T", " ")) : null,
       })),
     });
   });

@@ -13,8 +13,8 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-BACKEND_LOG=/tmp/mcp-server.log
-FRONTEND_LOG=/tmp/htmlview.log
+BACKEND_LOG="${TMPDIR:-/tmp}/mcp-server.log"
+FRONTEND_LOG="${TMPDIR:-/tmp}/htmlview.log"
 TARGET="${1:-all}" # all | backend | frontend
 
 log() { printf '%s\n' "$*"; }
