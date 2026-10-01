@@ -4,7 +4,7 @@
  * 覆盖本服务**所有业务接口**（登录认证 / 任务管理 / 参考物上传 / MCP / 系统操作），
  * 在应用层挂 res 'finish' 中间件统一留痕：动作（action）按「方法 + 路径」识别成
  * 中文功能名（见 ACTION_RULES），响应后异步写入 operation_log；读取端在 SysApi。
- * 例外：「我的」页 10s 轮询的 status/metrics/network 不记录（打开页面即刷屏）。
+ * 例外：「我的」页 10s 轮询的 status/metrics 与大模型信息读取 llm 不记录（打开页面即刷屏）。
  *
  * 路由识别用 `METHOD + originalUrl(去query)` 对有序正则表匹配 —— 不依赖
  * req.route / req.baseUrl（路由分发结束后 baseUrl 可能已被回收，finish 时取值不稳）。
@@ -61,11 +61,16 @@ const ACTION_RULES = [
   { re: /^POST \/api\/v1\/uploads$/, path: "/api/v1/uploads", action: "上传参考物" },
 
   // —— 系统状态 / 我的 Tab（SysApi /api/v1/server）——
-  // status/metrics/network 是「我的」页 10s 轮询，不记（否则打开页面即刷屏，
+  // status/metrics 是「我的」页 10s 轮询，不记（否则打开页面即刷屏，
   // 用户明确要求剔除）；只留用户主动操作：查日志、重启服务器。
   { re: /^GET \/api\/v1\/server\/logs\/all$/, path: "/api/v1/server/logs/all", action: "查询全部日志" },
   { re: /^GET \/api\/v1\/server\/logs$/, path: "/api/v1/server/logs", action: "查询最近日志" },
   { re: /^POST \/api\/v1\/server\/reboot$/, path: "/api/v1/server/reboot", action: "重启服务器" },
+  // /server/llm 是页面读取（模型目录 60s 缓存），与 status/metrics 同规则不记；
+  // 只有用户主动「切换大模型」才留痕。
+  { re: /^POST \/api\/v1\/server\/llm\/model$/, path: "/api/v1/server/llm/model", action: "切换大模型" },
+  { re: /^POST \/api\/v1\/server\/llm\/provider$/, path: "/api/v1/server/llm/provider", action: "新增大模型" },
+  { re: /^POST \/api\/v1\/server\/llm\/provider\/remove$/, path: "/api/v1/server/llm/provider/remove", action: "删除大模型" },
 
   // —— MCP（POST /mcp：动作按 JSON-RPC 方法/工具动态识别，见 mcpAction）——
   { re: /^POST \/mcp$/, path: "/mcp", action: null },

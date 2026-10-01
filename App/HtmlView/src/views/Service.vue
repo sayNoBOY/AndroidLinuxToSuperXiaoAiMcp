@@ -2,19 +2,20 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { push } from '../router.js'
 import {
-  getServerStatus, getServerMetrics, getServerNetwork,
+  getServerStatus, getServerMetrics,
   getServerLogs, getAllLogs, rebootServer,
+  getLlmInfo, switchLlmModel, addLlmProvider, removeLlmProvider,
 } from '../api/system.js'
 
 // 依据 随身互联App四Tab原型(6).html Tab4「我的」实现，接口对接 SysApi.js：
-//   status / metrics / network 10s 轮询（文档口径 5~10s），logs 首次 + 重启完成时刷新，
+//   status / metrics 10s 轮询（文档口径 5~10s），logs 首次 + 重启完成时刷新，
 //   reboot 调用 restart.sh 真实重启（前后端一起重启，vite 重载会打断本页 → 用
 //   sessionStorage 标记续等、期间静默吞错），全部日志走 /server/logs/all 分页弹层。
+//   llm = MiMoCode 大模型调用信息（读 mimocode 配置与模型目录，打开弹窗/切换后刷新）。
 
 const loading = ref(false)
 const status = ref(null)    // GET /server/status
 const metrics = ref(null)   // GET /server/metrics
-const network = ref(null)   // GET /server/network
 const logs = ref([])        // GET /server/logs（最近 5 条）
 const lastSync = ref('')    // 最后同步时间（yyyy-MM-dd HH:mm:ss）
 
@@ -22,9 +23,6 @@ const lastSync = ref('')    // 最后同步时间（yyyy-MM-dd HH:mm:ss）
 const upBase = ref(0)
 const upAt = ref(0)
 const uptimeText = ref('—')
-
-// 网络进度条满刻度：按本轮采样的最大速率动态定标（下限 1MB/s），避免固定值失真
-const netScale = ref(1048576)
 
 const rebooting = ref(false) // restarting 期间防重复触发
 
@@ -71,13 +69,6 @@ function barColor(p) {
   return 'var(--green)'
 }
 
-const upBarPct = computed(() => barPct(network.value?.uploadBps))
-const downBarPct = computed(() => barPct(network.value?.downloadBps))
-function barPct(bps = 0) {
-  return Math.max(bps > 0 ? 3 : 0, Math.min(100, Math.round((bps / netScale.value) * 100)))
-}
-const latencyCls = computed(() => (network.value?.latencyMs > 0 ? 'ok' : 'na'))
-
 function fmtUptime(sec) {
   const p = (n) => String(n).padStart(2, '0')
   const d = Math.floor(sec / 86400)
@@ -112,12 +103,6 @@ async function loadMetrics() {
   metrics.value = await getServerMetrics()
 }
 
-async function loadNetwork() {
-  const n = await getServerNetwork()
-  network.value = n
-  netScale.value = Math.max(1048576, n.uploadBps || 0, n.downloadBps || 0)
-}
-
 async function loadLogs() {
   const d = await getServerLogs({ limit: 5 })
   logs.value = d.list || []
@@ -125,7 +110,7 @@ async function loadLogs() {
 
 /** 三路状态并行拉取：单路失败不拖垮其余；重启窗口内静默（服务本来就 down），返回是否全成功 */
 async function loadRuntime() {
-  const rs = await Promise.allSettled([loadStatus(), loadMetrics(), loadNetwork()])
+  const rs = await Promise.allSettled([loadStatus(), loadMetrics()])
   const first = rs.find((r) => r.status === 'rejected')
   if (first) {
     if (!rebooting.value) toast(first.reason?.message || '状态刷新失败')
@@ -191,7 +176,7 @@ async function waitServerBack() {
     rebooting.value = false
     clearRebooting()
     toast('服务器已重启完成 ✓')
-    await Promise.allSettled([loadMetrics(), loadNetwork(), loadLogs()])
+    await Promise.allSettled([loadMetrics(), loadLogs()])
     lastSync.value = nowText()
     return
   }
@@ -271,6 +256,264 @@ function logDay(t) {
   return String(t || '').slice(5, 16).replace('T', ' ')
 }
 
+// ---------- MiMoCode 大模型调用信息（GET /server/llm：配置文件 + 当前模型 + 模型目录） ----------
+const llm = ref(null)        // GET /server/llm 响应 data
+const llmLoading = ref(false)
+const llmError = ref('')     // 模型目录拉取失败时的降级提示（卡片仍展示配置）
+
+const llmCurrent = computed(() => llm.value?.current || null)
+const llmModels = computed(() => llm.value?.models || [])
+const activeKey = computed(() => llm.value?.current?.active || '')
+const activeModel = computed(() => llmModels.value.find((m) => m.key === activeKey.value) || null)
+const llmProviders = computed(() => llm.value?.providers || [])
+const llmGroups = computed(() => llm.value?.config?.groupNames || [])
+const llmCreds = computed(() => llm.value?.credentials || [])
+
+/** token 计数用十进制后缀，与 `mimo models` 输出口径一致（1M / 1.05M / 944K） */
+function fmtTokens(n) {
+  if (n === null || n === undefined) return '—'
+  const trim = (x) => String(Math.round(x * 100) / 100)
+  if (n >= 1e6) return `${trim(n / 1e6)}M`
+  if (n >= 1e3) return `${trim(n / 1e3)}K`
+  return String(n)
+}
+
+const llmWindowText = computed(() => {
+  const m = activeModel.value
+  if (!m) return '—'
+  return `${fmtTokens(m.context)} tokens · 输出 ${fmtTokens(m.output)}`
+})
+const llmCostText = computed(() => {
+  const c = activeModel.value?.cost
+  if (!c) return '—'
+  return `输入 ${c.input} · 输出 ${c.output}`
+})
+const llmUrlText = computed(() => activeModel.value?.api?.url || '—')
+/** 配置来源：config=顶层 model（哪个文件），state=运行态 recent，default=MiMoCode 默认 */
+const llmSourceText = computed(() => {
+  const c = llmCurrent.value
+  if (!c) return '—'
+  if (c.source === 'config') return `${c.sourceFile?.split('/').slice(-2).join('/')} · model`
+  if (c.source === 'state') return `${c.stateFile?.split('/').slice(-2).join('/')} · recent`
+  return 'MiMoCode 默认'
+})
+const llmCapText = computed(() => {
+  const caps = activeModel.value?.capabilities
+  if (!caps) return '—'
+  const tags = []
+  if (caps.reasoning) tags.push('推理')
+  if (caps.toolcall) tags.push('工具调用')
+  if (caps.attachment) tags.push('附件')
+  const input = caps.input || {}
+  if (input.image) tags.push('图像输入')
+  if (input.audio) tags.push('音频输入')
+  if (input.video) tags.push('视频输入')
+  return tags.length ? tags.join(' · ') : '—'
+})
+
+async function loadLlm({ refresh = false, quiet = true } = {}) {
+  llmLoading.value = true
+  try {
+    llm.value = await getLlmInfo({ refresh })
+    llmError.value = llm.value?.listError || ''
+  } catch (e) {
+    llmError.value = e?.message || '大模型信息加载失败'
+    if (!quiet) toast(llmError.value)
+  } finally {
+    llmLoading.value = false
+  }
+}
+
+/** 常态轮询用：只更新数据不切换 loading（否则按钮每 10s 禁用一次），失败静默 */
+function pollLlm() {
+  getLlmInfo()
+    .then((d) => {
+      llm.value = d
+      llmError.value = d?.listError || ''
+    })
+    .catch(() => {})
+}
+
+// ---------- 切换大模型弹窗 ----------
+const swOpen = ref(false)
+const swKeyword = ref('')
+const swProvider = ref('')      // '' = 全部提供商
+const swSelected = ref('')      // 模型 key（provider/model）或分组名
+const swSwitching = ref(false)
+const swRefreshing = ref(false)
+const swError = ref('')
+
+/** 关键字 + 提供商过滤后的可选模型 */
+const swModels = computed(() => {
+  const kw = swKeyword.value.trim().toLowerCase()
+  return llmModels.value.filter((m) => {
+    if (swProvider.value && m.providerID !== swProvider.value) return false
+    if (!kw) return true
+    return `${m.key} ${m.name} ${m.providerID}`.toLowerCase().includes(kw)
+  })
+})
+const swSelectedModel = computed(() => llmModels.value.find((m) => m.key === swSelected.value) || null)
+const swIsGroup = computed(() => Boolean(swSelected.value) && !swSelected.value.includes('/'))
+const swCanConfirm = computed(
+  () => Boolean(swSelected.value) && swSelected.value !== activeKey.value && !swSwitching.value,
+)
+
+function openSwitcher() {
+  if (rebooting.value) return
+  swOpen.value = true
+  swKeyword.value = ''
+  swProvider.value = ''
+  swSelected.value = activeKey.value || ''
+  swError.value = ''
+  loadLlm({ refresh: true })
+}
+
+function pickModel(key) {
+  swSelected.value = key
+  swError.value = ''
+}
+
+async function refreshCatalog() {
+  swRefreshing.value = true
+  try {
+    await loadLlm({ refresh: true, quiet: false })
+    if (!llm.value?.models?.length) toast(llmError.value || '模型目录为空')
+  } finally {
+    swRefreshing.value = false
+  }
+}
+
+async function confirmSwitch() {
+  if (!swCanConfirm.value) return
+  swSwitching.value = true
+  swError.value = ''
+  try {
+    const r = await switchLlmModel(swSelected.value)
+    swOpen.value = false
+    toast(`已切换到 ${r.model} ✓`)
+    await loadLlm({ refresh: true, quiet: false })
+  } catch (e) {
+    swError.value = e?.message || '切换失败'
+  } finally {
+    swSwitching.value = false
+  }
+}
+
+function closeSwitcher() {
+  if (swSwitching.value) return
+  swOpen.value = false
+}
+
+// ---------- 新增大模型弹窗（主流厂商预设 / 自定义 OpenAI 兼容端点） ----------
+const adOpen = ref(false)
+const adSaving = ref(false)
+const adError = ref('')
+const adPresetId = ref('')   // 选中的预设 id；'' = 自定义填表
+const adShowKey = ref(false)
+
+function blankAddForm() {
+  return {
+    providerId: '', name: '', npm: '@ai-sdk/openai-compatible',
+    baseURL: '', modelId: '', modelName: '', apiKey: '', setAsCurrent: true,
+  }
+}
+const adForm = ref(blankAddForm())
+const adConfirmDel = ref('')   // 两步删除：先点 × 进入「确认」态，再点一次才删（不用原生 confirm）
+const adPresets = computed(() => llm.value?.presets || [])
+const adAdapters = computed(() => llm.value?.adapters || [{ npm: '@ai-sdk/openai-compatible', label: 'OpenAI 兼容' }])
+/** 已配置的自定义 provider（可删）与内置目录 provider（只读展示） */
+const adCustom = computed(() => llm.value?.config?.customProviders || [])
+const adCatalog = computed(() => llm.value?.providers || [])
+/** 当前填写的 providerId 是否命中内置目录（会并入其既有模型并共用新 baseURL） */
+const adIsCatalog = computed(() => adCatalog.value.includes(adForm.value.providerId.trim()))
+/** 目录里该 provider 的既有模型 key（提示用，最多列 4 个） */
+const adCatalogModels = computed(() =>
+  llmModels.value.filter((m) => m.providerID === adForm.value.providerId.trim()).map((m) => m.key),
+)
+const adCanSubmit = computed(() =>
+  !adSaving.value &&
+  adForm.value.providerId && adForm.value.npm && adForm.value.baseURL && adForm.value.modelId,
+)
+
+function openAdder() {
+  if (rebooting.value) return
+  adOpen.value = true
+  adError.value = ''
+  adShowKey.value = false
+  adPresetId.value = ''
+  adConfirmDel.value = ''
+  adForm.value = blankAddForm()
+  if (!llm.value) loadLlm()
+}
+
+function closeAdder() {
+  if (adSaving.value) return
+  adOpen.value = false
+}
+
+function applyPreset(p) {
+  adPresetId.value = p.id
+  adConfirmDel.value = ''
+  adForm.value = {
+    providerId: p.providerId, name: p.label, npm: p.npm,
+    baseURL: p.baseURL, modelId: p.modelId, modelName: p.modelName,
+    apiKey: adForm.value.apiKey, setAsCurrent: adForm.value.setAsCurrent,
+  }
+  adError.value = ''
+}
+
+async function submitAdd() {
+  if (!adCanSubmit.value) return
+  adSaving.value = true
+  adError.value = ''
+  const f = adForm.value
+  try {
+    const r = await addLlmProvider({
+      providerId: f.providerId.trim(),
+      name: f.name.trim() || f.providerId.trim(),
+      npm: f.npm,
+      baseURL: f.baseURL.trim(),
+      modelId: f.modelId.trim(),
+      modelName: f.modelName.trim() || f.modelId.trim(),
+      apiKey: f.apiKey.trim() || undefined,
+      setAsCurrent: f.setAsCurrent === true,
+    })
+    adOpen.value = false
+    if (r.verified) {
+      const warn = r.endpointConflicts?.length
+        ? `（${(r.preservedCatalogModels || []).join('、')} 已并入，端点改用新 baseURL）`
+        : ''
+      toast(`已新增 ${r.providerId}${r.model ? ` · 当前模型 ${r.model}` : ''} ✓${warn}`)
+    } else toast(r.note)
+    await loadLlm({ refresh: true, quiet: false })
+  } catch (e) {
+    adError.value = e?.message || '新增失败'
+  } finally {
+    adSaving.value = false
+  }
+}
+
+/** 两步删除：首次点 × 进入「确认」态，再点一次才真正删（不依赖原生 confirm） */
+function onDelClick(id) {
+  if (adSaving.value) return
+  if (adConfirmDel.value !== id) {
+    adConfirmDel.value = id
+    return
+  }
+  adConfirmDel.value = ''
+  removeProvider(id)
+}
+
+async function removeProvider(id) {
+  try {
+    const r = await removeLlmProvider(id)
+    toast(`已删除 ${r.providerId} ✓`)
+    await loadLlm({ refresh: true, quiet: false })
+  } catch (e) {
+    toast(e?.message || '删除失败')
+  }
+}
+
 // ---------- 生命周期 ----------
 let pollTimer = null
 let tickTimer = null
@@ -283,9 +526,14 @@ onMounted(async () => {
   } else {
     await refreshAll()
   }
-  // 常态轮询：status/metrics/network 每 10s（文档口径 5~10s；留痕由服务端 7 天策略控制）
-  pollTimer = setInterval(loadRuntime, 10000)
+  // 常态轮询：status/metrics 每 10s（文档口径 5~10s；留痕由服务端 7 天策略控制）；
+  // llm 同频刷新但不进 loading（服务端模型目录 60s 缓存，接口耗时可忽略）
+  pollTimer = setInterval(() => {
+    loadRuntime()
+    pollLlm()
+  }, 10000)
   tickTimer = setInterval(tickUptime, 1000)
+  loadLlm() // 大模型调用信息：首屏读一次
 })
 
 onUnmounted(() => {
@@ -357,20 +605,66 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- 网络信息 -->
+      <!-- MiMoCode 大模型调用信息（读 mimocode 配置 / 运行态 / 模型目录） -->
       <div class="card">
-        <div class="card-title">网络信息</div>
-        <div class="net-row">
-          <div class="net-head"><span>上行</span><span class="net-v">{{ network?.upload || '—' }}</span></div>
-          <div class="resbar"><div :style="{ width: upBarPct + '%', background: 'var(--cyan)' }"></div></div>
+        <div class="card-title llm-title">
+          <span>MiMoCode 大模型</span>
+          <span class="llm-badge" :class="llmCurrent ? 'ok' : 'gray'">
+            {{ llmLoading && !llm ? '读取中…' : llmError ? '目录异常' : llmCurrent ? '已接入' : '未读取' }}
+          </span>
         </div>
-        <div class="net-row">
-          <div class="net-head"><span>下行</span><span class="net-v">{{ network?.download || '—' }}</span></div>
-          <div class="resbar"><div :style="{ width: downBarPct + '%', background: 'var(--cyan)' }"></div></div>
+
+        <div class="llm-hero">
+          <div class="llm-ic">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#a855f7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3l1.8 4.6L18.5 9l-4.7 1.4L12 15l-1.8-4.6L5.5 9l4.7-1.4z" />
+              <path d="M18.5 15.5l.9 2.3 2.3.9-2.3.9-.9 2.3-.9-2.3-2.3-.9 2.3-.9z" />
+            </svg>
+          </div>
+          <div class="llm-hero-main">
+            <div class="llm-name">{{ activeModel?.name || activeKey || 'MiMoCode 默认' }}</div>
+            <div class="llm-key">{{ activeKey || '—' }}</div>
+          </div>
+          <span class="st" :class="activeModel?.status === 'active' ? 'green' : 'red'" v-if="activeModel">
+            {{ activeModel.status === 'active' ? '✓ 可用' : '✕ ' + (activeModel.status || '未知') }}
+          </span>
         </div>
-        <div class="net-head flat">
-          <span>延迟</span>
-          <span :class="['lat', latencyCls]">{{ network ? network.latencyText : '—' }}</span>
+
+        <div class="kv"><span class="k">提供商</span><span class="v">{{ activeModel?.providerID || llmProviders.join(' / ') || '—' }}</span></div>
+        <div class="kv"><span class="k">上下文窗口</span><span class="v">{{ llmWindowText }}</span></div>
+        <div class="kv"><span class="k">接口地址</span><span class="v">{{ llmUrlText }}</span></div>
+        <div class="kv"><span class="k">能力</span><span class="v">{{ llmCapText }}</span></div>
+        <div class="kv"><span class="k">计费 input/output</span><span class="v">{{ llmCostText }}</span></div>
+        <div class="kv"><span class="k">凭据</span>
+          <span class="v">{{ llmCreds.length ? llmCreds.map((c) => `${c.provider}(${c.hasKey ? '已配密钥' : '无密钥'})`).join(' · ') : '未配置' }}</span>
+        </div>
+        <div class="kv"><span class="k">配置来源</span><span class="v">{{ llmSourceText }}</span></div>
+
+        <div class="llm-chips">
+          <span class="llm-chips-lab">最近使用</span>
+          <span
+            v-for="r in (llmCurrent?.recent || []).slice(0, 4)" :key="r"
+            class="llm-chip" :class="{ on: r === activeKey }"
+          >{{ r.split('/')[1] || r }}</span>
+          <span v-if="!(llmCurrent?.recent || []).length" class="llm-chips-empty">—</span>
+        </div>
+        <div v-if="llmError" class="llm-warn">{{ llmError }}</div>
+
+        <!-- 模块操作：切换 / 新增大模型（按用户要求放在此信息模块内，重启服务器仍在页面底部） -->
+        <div class="llm-actions">
+          <button class="btn line" :disabled="rebooting || llmLoading" @click="openSwitcher">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12a9 9 0 0 1-15.5 6.2M3 12a9 9 0 0 1 15.5-6.2" />
+              <path d="M3 21v-6h6M21 3v6h-6" />
+            </svg>
+            切换大模型
+          </button>
+          <button class="btn primary" :disabled="rebooting || llmLoading" @click="openAdder">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            新增大模型
+          </button>
         </div>
       </div>
 
@@ -390,7 +684,7 @@ onUnmounted(() => {
         <button class="more-btn" @click="openLogs">查看全部日志</button>
       </div>
 
-      <!-- 操作按钮：按用户要求只保留重启服务器（查看日志入口 = 上方「查看全部日志」） -->
+      <!-- 操作按钮：只保留重启服务器（切换/新增大模型已移入上方信息模块，查看日志入口 = 「查看全部日志」） -->
       <div class="conn">
         <button class="btn red" style="flex: 1" :disabled="rebooting" @click="reboot">
           {{ rebooting ? '重启中…' : '重启服务器' }}
@@ -471,6 +765,208 @@ onUnmounted(() => {
         </div>
       </div>
     </div>
+
+    <!-- 切换大模型弹层（GET /server/llm 目录 + POST /server/llm/model 写回 mimocode 配置） -->
+    <div class="overlay" :class="{ show: swOpen }" @click.self="closeSwitcher">
+      <div class="sheet sheet--llm">
+        <div class="sheet-head">
+          <h3>切换大模型</h3>
+          <button class="close-x" aria-label="关闭" title="关闭" :disabled="swSwitching" @click="closeSwitcher">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
+          </button>
+        </div>
+
+        <div class="sw-cur">
+          <div class="sw-cur-main">
+            <div class="sw-cur-l">当前模型</div>
+            <div class="sw-cur-v">{{ activeKey || 'MiMoCode 默认' }}</div>
+            <div class="sw-file">{{ llmSourceText }}</div>
+          </div>
+          <button class="btn sm line" :disabled="swRefreshing" @click="refreshCatalog">
+            {{ swRefreshing ? '刷新中…' : '刷新目录' }}
+          </button>
+        </div>
+
+        <div class="log-search">
+          <input v-model="swKeyword" class="input" placeholder="搜索模型名称 / key / 提供商…" />
+        </div>
+        <div class="tabs3">
+          <div class="tab3" :class="{ on: swProvider === '' }" @click="swProvider = ''">全部</div>
+          <div
+            v-for="p in llmProviders" :key="p"
+            class="tab3" :class="{ on: swProvider === p }"
+            @click="swProvider = p"
+          >{{ p }}</div>
+        </div>
+
+        <div v-if="llmGroups.length" class="sw-grp">
+          <span class="sw-grp-l">模型分组</span>
+          <span
+            v-for="g in llmGroups" :key="g"
+            class="grp-chip" :class="{ on: swSelected === g }"
+            @click="pickModel(g)"
+          >{{ g }}</span>
+        </div>
+
+        <div class="log-scroll sw-list">
+          <div v-if="llmLoading && !llmModels.length" class="center muted" style="padding: 20px 0">模型加载中…</div>
+          <div v-else-if="!swModels.length" class="center muted" style="padding: 20px 0">无匹配的模型</div>
+          <label
+            v-for="m in swModels" :key="m.key"
+            class="sw-item" :class="{ on: swSelected === m.key, cur: m.key === activeKey }"
+          >
+            <input
+              type="radio" name="sw-llm-model" class="sw-radio"
+              :checked="swSelected === m.key" :disabled="swSwitching"
+              @change="pickModel(m.key)"
+            />
+            <span class="sw-item-main">
+              <span class="sw-item-name">
+                {{ m.name }}
+                <em class="sw-item-key">{{ m.key }}</em>
+              </span>
+              <span class="sw-item-meta">
+                窗口 {{ fmtTokens(m.context) }} · 输出 {{ fmtTokens(m.output) }} · 计费 {{ m.cost?.input }}/{{ m.cost?.output }}
+              </span>
+            </span>
+            <span class="sw-tags">
+              <span v-if="m.isFavorite" class="mini-tag fav" title="收藏">★</span>
+              <span v-if="m.key === activeKey" class="mini-tag cur">当前</span>
+              <span v-else-if="m.isRecent" class="mini-tag">最近</span>
+            </span>
+          </label>
+        </div>
+
+        <div class="sw-detail">
+          <template v-if="swSelectedModel">
+            <div class="sw-detail-row"><span>接口地址</span><em>{{ swSelectedModel.api?.url || '—' }}</em></div>
+            <div class="sw-detail-row"><span>适配器</span><em>{{ swSelectedModel.api?.npm || '—' }}</em></div>
+            <div class="sw-detail-row"><span>变体</span><em>{{ (swSelectedModel.variants || []).join(' / ') || '—' }}</em></div>
+          </template>
+          <div v-else-if="swIsGroup" class="sw-detail-row">
+            <span>模型分组</span><em>{{ swSelected }}（按配置 model_groups 解析）</em>
+          </div>
+          <div v-else class="sw-detail-row"><span>提示</span><em>请选择要切换的模型</em></div>
+        </div>
+
+        <div v-if="swError" class="llm-warn">{{ swError }}</div>
+
+        <div class="sw-foot">
+          <button class="btn line" :disabled="swSwitching" @click="closeSwitcher">取消</button>
+          <button class="btn primary" :disabled="!swCanConfirm" @click="confirmSwitch">
+            {{ swSwitching ? '切换中…' : swCanConfirm ? `切换到 ${swSelectedModel?.name || swSelected}` : (swSelected ? '与当前相同' : '请选择模型') }}
+          </button>
+        </div>
+        <div class="sw-note">切换写回 mimocode 配置的顶层 model；新会话生效，已运行的 MiMoCode 需重新选择或重启。</div>
+      </div>
+    </div>
+
+    <!-- 新增大模型弹层（厂商预设 / 自定义端点 → POST /server/llm/provider） -->
+    <div class="overlay" :class="{ show: adOpen }" @click.self="closeAdder">
+      <div class="sheet sheet--add">
+        <div class="sheet-head">
+          <h3>新增大模型</h3>
+          <button class="close-x" aria-label="关闭" title="关闭" :disabled="adSaving" @click="closeAdder">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
+          </button>
+        </div>
+
+        <!-- 已接入：目录 provider 只读，自定义 provider 可删 -->
+        <div v-if="adCatalog.length || adCustom.length" class="ad-exist">
+          <span class="ad-lab">已接入</span>
+          <span v-for="p in adCatalog" :key="'c' + p" class="ad-chip">{{ p }}</span>
+          <span v-for="p in adCustom" :key="'u' + p.id" class="ad-chip own">
+            {{ p.id }}<em>{{ p.modelCount }} 模型</em>
+            <button
+              class="ad-del" :class="{ arm: adConfirmDel === p.id }" :disabled="adSaving"
+              :title="adConfirmDel === p.id ? `再次点击确认删除 ${p.id}` : `删除 ${p.id}`"
+              @click.stop="onDelClick(p.id)"
+            >{{ adConfirmDel === p.id ? '确认' : '×' }}</button>
+          </span>
+        </div>
+
+        <div class="ad-sec">
+          <span class="ad-lab">厂商预设（点击带出，均可改）</span>
+          <div class="ad-presets">
+            <button
+              v-for="p in adPresets" :key="p.id"
+              class="ad-preset" :class="{ on: adPresetId === p.id }"
+              :disabled="adSaving" type="button" @click="applyPreset(p)"
+            >
+              <b>{{ p.label }}</b><i>{{ p.vendor }}</i>
+            </button>
+          </div>
+        </div>
+
+        <div class="log-scroll ad-form">
+          <label class="ad-field">
+            <span>Provider ID</span>
+            <input v-model="adForm.providerId" class="input" :disabled="adSaving" placeholder="小写字母/数字/中划线，如 deepseek" />
+            <em v-if="adIsCatalog" class="ad-hint">
+              「{{ adForm.providerId.trim() }}」是内置目录 provider：其既有模型
+              {{ adCatalogModels.slice(0, 4).join('、') }}{{ adCatalogModels.length > 4 ? ' 等' : '' }}
+              会一并并入配置保留，并与新模型共用下方 baseURL。
+            </em>
+          </label>
+          <div class="ad-grid">
+            <label class="ad-field">
+              <span>显示名称</span>
+              <input v-model="adForm.name" class="input" :disabled="adSaving" placeholder="DeepSeek" />
+            </label>
+            <label class="ad-field">
+              <span>适配器</span>
+              <select v-model="adForm.npm" class="input ad-select" :disabled="adSaving">
+                <option v-for="a in adAdapters" :key="a.npm" :value="a.npm">{{ a.label }}</option>
+              </select>
+            </label>
+          </div>
+          <label class="ad-field">
+            <span>接口地址 baseURL</span>
+            <input v-model="adForm.baseURL" class="input" :disabled="adSaving" placeholder="https://api.deepseek.com/v1" />
+          </label>
+          <div class="ad-grid">
+            <label class="ad-field">
+              <span>模型 ID</span>
+              <input v-model="adForm.modelId" class="input" :disabled="adSaving" placeholder="deepseek-chat" />
+            </label>
+            <label class="ad-field">
+              <span>模型显示名</span>
+              <input v-model="adForm.modelName" class="input" :disabled="adSaving" placeholder="DeepSeek Chat" />
+            </label>
+          </div>
+          <label class="ad-field">
+            <span>API Key</span>
+            <div class="ad-key">
+              <input
+                v-model="adForm.apiKey" class="input"
+                :type="adShowKey ? 'text' : 'password'"
+                :disabled="adSaving" placeholder="sk-… 或 {env:MY_KEY}；本地端点可留空"
+              />
+              <button class="ad-eye" type="button" @click="adShowKey = !adShowKey">
+                {{ adShowKey ? '隐藏' : '显示' }}
+              </button>
+            </div>
+          </label>
+          <label class="ad-check">
+            <input v-model="adForm.setAsCurrent" type="checkbox" :disabled="adSaving" />
+            <span>添加后设为当前模型（写入顶层 model 并置入 recent）</span>
+          </label>
+        </div>
+
+        <div v-if="adError" class="llm-warn">{{ adError }}</div>
+
+        <div class="sw-foot">
+          <button class="btn line" :disabled="adSaving" @click="closeAdder">取消</button>
+          <button class="btn primary" :disabled="!adCanSubmit" @click="submitAdd">
+            {{ adSaving ? '添加中…' : '添加' }}
+          </button>
+        </div>
+        <div class="sw-note">
+          预设 baseURL 为厂商公开端点、模型 ID 为可编辑示例（以厂商文档为准）；密钥明文写入 mimocode 配置，
+          也可用 <b>{env:VAR}</b> 引用环境变量。写回后新会话生效。
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -481,7 +977,7 @@ onUnmounted(() => {
 .page {
   --bg: #0a0e1a; --card: #111827; --card2: #0f1522; --line: #1f2937;
   --t1: #e5e7eb; --t2: #9ca3af; --t3: #6b7280;
-  --blue: #3b82f6; --orange: #f97316; --cyan: #22d3ee; --purple: #a855f7;
+  --blue: #3b82f6; --orange: #f97316; --purple: #a855f7;
   --green: #22c55e; --red: #ef4444; --yellow: #eab308;
   --radius: 16px;
 
@@ -560,17 +1056,6 @@ onUnmounted(() => {
 .pbar > div { height: 100%; border-radius: 6px; transition: width 0.5s ease }
 .pbar.anim > div { animation: fill 1s ease forwards }
 @keyframes fill { from { width: 0 } }
-.resbar { width: 100%; height: 5px; background: #1e293b; border-radius: 4px; overflow: hidden; margin-top: 5px }
-.resbar > div { height: 100%; border-radius: 4px; transition: width 0.5s }
-
-/* ===== 网络信息 ===== */
-.net-row { margin-bottom: 12px }
-.net-head { display: flex; justify-content: space-between; font-size: 12px; color: var(--t3); margin-bottom: 5px }
-.net-head.flat { margin-bottom: 0 }
-.net-v { color: var(--cyan) }
-.lat { font-weight: 600 }
-.lat.ok { color: var(--green) }
-.lat.na { color: var(--t3) }
 
 /* ===== 日志 ===== */
 .log-box { max-height: 180px; overflow-y: auto; -webkit-overflow-scrolling: touch }
@@ -610,6 +1095,7 @@ onUnmounted(() => {
   position: fixed; left: 50%; bottom: 90px; transform: translateX(-50%) translateY(20px);
   background: #1f2937; color: var(--t1); padding: 10px 18px; border-radius: 12px; font-size: 13px;
   z-index: 99; opacity: 0; pointer-events: none; transition: 0.25s;
+  max-width: 78%; text-align: center; line-height: 1.5;
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0) }
 
@@ -675,4 +1161,156 @@ onUnmounted(() => {
 
 /* 分页 */
 .pager { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 12px; flex-shrink: 0 }
+
+/* ===== MiMoCode 大模型调用信息卡 ===== */
+.llm-title { display: flex; align-items: center; justify-content: space-between; gap: 8px }
+.llm-badge { padding: 3px 9px; border-radius: 20px; font-size: 10.5px; font-weight: 700; flex-shrink: 0 }
+.llm-badge.ok { color: var(--purple); background: rgba(168, 85, 247, 0.14) }
+.llm-badge.gray { color: var(--t3); background: var(--card2) }
+
+.llm-hero {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+  background: var(--card2); border-radius: 12px; margin-bottom: 10px;
+}
+.llm-ic {
+  width: 36px; height: 36px; border-radius: 10px; background: rgba(168, 85, 247, 0.14);
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.llm-hero-main { flex: 1; min-width: 0 }
+.llm-name { font-size: 14px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.llm-key { font-size: 11px; color: var(--t3); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+
+.llm-chips {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line);
+}
+.llm-chips-lab { font-size: 11px; color: var(--t3); flex-shrink: 0 }
+.llm-chip {
+  padding: 4px 9px; border-radius: 8px; background: var(--card2); color: var(--t2);
+  font-size: 11px; font-weight: 600; max-width: 42%;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.llm-chip.on { background: rgba(168, 85, 247, 0.16); color: var(--purple) }
+.llm-chips-empty { color: var(--t3); font-size: 11px }
+.llm-warn {
+  margin-top: 8px; padding: 7px 9px; border-radius: 8px; font-size: 11.5px;
+  color: var(--yellow); background: rgba(234, 179, 8, 0.1); word-break: break-all;
+}
+
+/* ===== 切换大模型弹层 ===== */
+.sw-cur {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: var(--card2); border-radius: 12px; padding: 10px 12px; margin-top: 12px; flex-shrink: 0;
+}
+.sw-cur-main { min-width: 0 }
+.sw-cur-l { font-size: 10.5px; color: var(--t3) }
+.sw-cur-v { font-size: 14px; font-weight: 700; color: var(--t1); margin-top: 2px; word-break: break-all }
+.sw-file { font-size: 10.5px; color: var(--t3); margin-top: 3px; word-break: break-all }
+.sheet--llm .log-search { margin-top: 10px; margin-bottom: 0 }
+.sheet--llm .tabs3 { margin: 10px 0 8px }
+
+.sw-grp { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; flex-shrink: 0 }
+.sw-grp-l { font-size: 11px; color: var(--t3) }
+.grp-chip {
+  padding: 4px 10px; border-radius: 20px; font-size: 11.5px; font-weight: 600;
+  background: var(--card); color: var(--t3); cursor: pointer; transition: 0.2s;
+}
+.grp-chip.on { background: rgba(168, 85, 247, 0.16); color: var(--purple) }
+
+.sw-list { max-height: 34vh; padding-bottom: 4px }
+.sw-item {
+  display: flex; align-items: center; gap: 10px; padding: 10px; margin-bottom: 8px;
+  border: 1px solid var(--line); border-radius: 10px; cursor: pointer; transition: 0.15s;
+}
+.sw-item:active { transform: scale(0.99) }
+.sw-item.on { border-color: var(--purple); background: rgba(168, 85, 247, 0.1) }
+.sw-item.cur { box-shadow: inset 3px 0 0 var(--green) }
+.sw-radio { width: 16px; height: 16px; margin: 0; accent-color: var(--purple); flex-shrink: 0 }
+.sw-item-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px }
+.sw-item-name { font-size: 13px; font-weight: 700; color: var(--t1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.sw-item-key { font-style: normal; font-size: 10.5px; font-weight: 500; color: var(--t3); margin-left: 6px }
+.sw-item-meta { font-size: 11px; color: var(--t2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.sw-tags { display: flex; gap: 4px; flex-shrink: 0 }
+.mini-tag {
+  font-size: 9.5px; font-weight: 700; padding: 2px 6px; border-radius: 6px;
+  background: var(--card2); color: var(--t3);
+}
+.mini-tag.cur { background: rgba(34, 197, 94, 0.14); color: var(--green) }
+.mini-tag.fav { background: rgba(234, 179, 8, 0.14); color: var(--yellow) }
+
+.sw-detail { background: var(--card2); border-radius: 10px; padding: 8px 10px; flex-shrink: 0 }
+.sw-detail-row { display: flex; justify-content: space-between; gap: 10px; font-size: 11.5px; padding: 3px 0 }
+.sw-detail-row span { color: var(--t3); flex-shrink: 0 }
+.sw-detail-row em { font-style: normal; color: var(--t2); text-align: right; word-break: break-all }
+
+.sw-foot { display: flex; gap: 8px; padding-top: 12px; flex-shrink: 0 }
+.sw-foot .btn { flex: 1; justify-content: center }
+.sw-note { font-size: 10.5px; color: var(--t3); line-height: 1.5; margin-top: 8px; flex-shrink: 0 }
+.close-x:disabled { opacity: 0.5 }
+
+/* ===== 信息模块内操作按钮（切换 / 新增大模型） ===== */
+.llm-actions {
+  display: flex; gap: 8px; margin-top: 12px;
+  padding-top: 12px; border-top: 1px solid var(--line);
+}
+.llm-actions .btn { flex: 1; justify-content: center }
+
+/* ===== 新增大模型弹层 ===== */
+.ad-exist { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; flex-shrink: 0 }
+.ad-lab { font-size: 11px; color: var(--t3); flex-shrink: 0 }
+.ad-chip {
+  display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 8px;
+  background: var(--card2); color: var(--t2); font-size: 11px; font-weight: 600;
+}
+.ad-chip em { font-style: normal; font-size: 9.5px; color: var(--t3) }
+.ad-chip.own { color: var(--purple); background: rgba(168, 85, 247, 0.12) }
+.ad-del {
+  width: 16px; height: 16px; padding: 0; border: none; border-radius: 50%;
+  background: rgba(239, 68, 68, 0.18); color: var(--red); font-size: 12px; line-height: 1;
+  cursor: pointer; font-family: inherit;
+}
+.ad-del:active { transform: scale(0.9) }
+.ad-del:disabled { opacity: 0.5 }
+.ad-del.arm {
+  width: auto; padding: 0 7px; border-radius: 10px; font-size: 10px; font-weight: 700;
+  background: var(--red); color: #fff;
+}
+
+.ad-sec { margin-top: 12px; flex-shrink: 0 }
+.ad-presets { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 7px }
+.ad-preset {
+  display: flex; flex-direction: column; gap: 2px; padding: 7px 10px; border-radius: 10px;
+  border: 1px solid var(--line); background: var(--card); cursor: pointer;
+  transition: 0.15s; font-family: inherit; text-align: left;
+}
+.ad-preset b { font-size: 12.5px; color: var(--t1); font-weight: 700 }
+.ad-preset i { font-style: normal; font-size: 9.5px; color: var(--t3) }
+.ad-preset.on { border-color: var(--purple); background: rgba(168, 85, 247, 0.12) }
+.ad-preset.on b { color: var(--purple) }
+.ad-preset:active { transform: scale(0.97) }
+.ad-preset:disabled { opacity: 0.6 }
+
+.ad-form { padding-top: 10px; display: flex; flex-direction: column; gap: 9px }
+.ad-field { display: flex; flex-direction: column; gap: 5px; min-width: 0 }
+.ad-field > span { font-size: 11px; color: var(--t3) }
+.ad-hint {
+  font-style: normal; font-size: 10.5px; line-height: 1.55; color: var(--yellow);
+  background: rgba(234, 179, 8, 0.09); padding: 6px 8px; border-radius: 8px;
+}
+.ad-grid { display: flex; gap: 8px }
+.ad-grid .ad-field { flex: 1; min-width: 0 }
+.ad-select { appearance: auto; padding: 9px 10px }
+.ad-key { display: flex; gap: 6px; align-items: center }
+.ad-key .input { flex: 1; min-width: 0 }
+.ad-eye {
+  flex-shrink: 0; padding: 8px 9px; border-radius: 8px; border: 1px solid var(--line);
+  background: transparent; color: var(--t2); font-size: 11px; cursor: pointer; font-family: inherit;
+}
+.ad-check {
+  display: flex; align-items: flex-start; gap: 8px; font-size: 11.5px; color: var(--t2);
+  line-height: 1.5; cursor: pointer;
+}
+.ad-check input { width: 15px; height: 15px; margin-top: 1px; accent-color: var(--purple); flex-shrink: 0 }
+.ad-check span { flex: 1 }
+
 </style>

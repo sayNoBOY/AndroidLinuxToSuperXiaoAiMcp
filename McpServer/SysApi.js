@@ -4,9 +4,12 @@
  *
  *   GET  /api/v1/server/status      服务器概览状态（运行时采集，不落库，需 Bearer）
  *   GET  /api/v1/server/metrics     CPU/内存/磁盘使用率（运行时采样，需 Bearer）
- *   GET  /api/v1/server/network     网络上行/下行/延迟（运行时采样，需 Bearer）
  *   GET  /api/v1/server/logs        最近操作记录（读 operation_log，limit 默认 5，需 Bearer）
  *   GET  /api/v1/server/logs/all    全部操作记录分页（page/pageSize/result/keyword/时间范围，需 Bearer）
+ *   GET  /api/v1/server/llm         MiMoCode 大模型调用信息（配置文件 / 当前模型 / 模型目录 / 厂商预设，需 Bearer）
+ *   POST /api/v1/server/llm/model   切换大模型（写回 mimocode 配置顶层 model + 运行态 recent，需 Bearer）
+ *   POST /api/v1/server/llm/provider        新增大模型 provider（Claude/OpenAI/DeepSeek/千问/GLM/Kimi… 预设或自定义，需 Bearer）
+ *   POST /api/v1/server/llm/provider/remove 删除已配置的自定义 provider（连带清理其 model/recent，需 Bearer）
  *   POST /api/v1/server/reboot      重启服务器（页面底部唯一按钮；调用仓库根目录 restart.sh
  *                                   真实重启前后端——脚本第一步就 pkill 本进程，故响应发出后
  *                                   再 spawn 脚本；新进程启动即为 running，需 Bearer）
@@ -14,7 +17,7 @@
  * 数据库：SQLite（复用 LoginApi 的 getDb() 连接，库文件 data/suishen.db），唯一表 operation_log
  * （数据库文档 v1.4：实时状态不落库、活动日志已移除，只保留操作日志）。建表/种子/7天清理与
  * **全局**操作留痕中间件在 OpLog.js（覆盖登录/任务/上传/MCP/系统全部接口），本模块只做读取。
- * 实时状态：状态机与启动时间存模块内存；CPU/内存/磁盘/网络从 os、df、/proc 实时读取，不进数据库。
+ * 实时状态：状态机与启动时间存模块内存；CPU/内存/磁盘从 os、df 实时读取，均不进数据库。
  *
  * 与文档的差异（均有原因）：
  * 1. 通用响应信封沿用本服务 LoginApi/TaskApi 约定 —— 成功 { code, message, data, timestamp }
@@ -29,7 +32,7 @@
  *    （缺失/中途失败）由 error/exit 监听回滚为 running。
  * 3. 响应字段按文档使用 camelCase（serverId / resultCode / occurredAt …），与库列 snake_case
  *    在序列化时转换。
- * 4. status/metrics/network 为 10s 轮询，**不写**操作日志（OpLog 的规则表已剔除，
+ * 4. status/metrics 为 10s 轮询，**不写**操作日志（OpLog 的规则表已剔除，
  *    否则打开「我的」页日志区全是"查看服务器状态"）；留痕只覆盖查日志/重启等主动操作。
  *
  * 挂载方式：import { mountSysApi } from "./SysApi.js"; mountSysApi(app);
@@ -39,18 +42,29 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync, spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
 import express from "express";
 import cors from "cors";
 import { getDb, requireAuth, isPrivateOrigin, mountLoginApi } from "./LoginApi.js";
 import { ensureOperationLog, mountOperationLog } from "./OpLog.js";
+import {
+  UsageError,
+  currentModelInfo,
+  listModels,
+  readCredentials,
+  readMergedConfig,
+  summarizeProviders,
+  switchModel,
+  addProvider,
+  removeProvider,
+  PROVIDER_PRESETS,
+  ADAPTERS,
+} from "./MiMoCodeConfig.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const SERVER_ID = 1; // 文档：单服务器（缺省 serverId=1）
 const REBOOT_SECONDS = 10; // 文档 POST /reboot：estimatedSeconds（restart.sh 冷启动经验 6~10s）
 const RESTART_SCRIPT = path.resolve(__dirname, "..", "restart.sh"); // 仓库根目录的重启脚本
-const LATENCY_TTL_MS = 5_000; // 延迟探测缓存（ping 每 5s 最多一次）
 const CPU_SAMPLE_MS = 200; // CPU 首次采样两次读取的间隔
 
 // ---------------------------------------------------------------------------
@@ -216,72 +230,6 @@ function readDisk() {
   }
 }
 
-// --- 网络速率：/proc/net/dev 两次采样差分（排除 lo） ---
-let prevNet = null;
-
-function netSnapshot() {
-  try {
-    const txt = readFileSync("/proc/net/dev", "utf-8");
-    let rx = 0;
-    let tx = 0;
-    for (const line of txt.split("\n").slice(2)) {
-      const idx = line.indexOf(":");
-      if (idx < 0) continue;
-      const iface = line.slice(0, idx).trim();
-      if (iface === "lo") continue;
-      const p = line.slice(idx + 1).trim().split(/\s+/);
-      rx += Number(p[0]) || 0;
-      tx += Number(p[8]) || 0;
-    }
-    return { rx, tx, at: Date.now() };
-  } catch {
-    return null;
-  }
-}
-
-function formatBps(bps) {
-  if (bps >= 1e6) return `${(bps / 1e6).toFixed(1)} MB/s`;
-  if (bps >= 1e3) return `${(bps / 1e3).toFixed(1)} KB/s`;
-  return `${Math.round(bps)} B/s`;
-}
-
-// --- 延迟：ping 默认网关（/proc/net/route 解析），结果缓存 5s；任何失败返回 0 ---
-let latencyCache = { at: 0, ms: 0 };
-
-function defaultGateway() {
-  try {
-    const txt = readFileSync("/proc/net/route", "utf-8");
-    for (const line of txt.split("\n").slice(1)) {
-      const p = line.trim().split(/\s+/);
-      if (p[1] === "00000000" && p[2] && p[2] !== "00000000") {
-        const bytes = (p[2].match(/../g) || []).map((h) => parseInt(h, 16)).reverse();
-        const ip = bytes.join(".");
-        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return ip; // 校验后再进命令行，防注入
-      }
-    }
-  } catch {
-    /* /proc 不可读时放弃 */
-  }
-  return null;
-}
-
-function readLatencyMs() {
-  if (Date.now() - latencyCache.at < LATENCY_TTL_MS) return latencyCache.ms;
-  let ms = 0;
-  const gw = defaultGateway();
-  if (gw) {
-    try {
-      const out = execSync(`ping -c 1 -W 1 ${gw}`, { encoding: "utf-8", timeout: 2000 });
-      const m = out.match(/time[=<]([\d.]+)\s*ms/);
-      if (m) ms = Math.round(Number(m[1]));
-    } catch {
-      ms = 0;
-    }
-  }
-  latencyCache = { at: Date.now(), ms };
-  return ms;
-}
-
 // operation_log 的建表/种子/清理与全局留痕中间件在 OpLog.js，这里只保留读取连接
 let db = null;
 
@@ -374,34 +322,100 @@ export function mountSysApi(app) {
     }
   });
 
-  // GET /api/v1/server/network —— 上行/下行/延迟（运行时采样，不落库）
-  router.get("/network", requireAuth, (req, res) => {
-    const serverId = resolveServerId(req.query.serverId, res);
-    if (serverId === null) return;
+  // GET /api/v1/server/llm —— MiMoCode 大模型调用信息（读配置与运行态，模型目录 60s 缓存，不落库）
+  //   不进 OpLog：与 status/metrics 同类，属页面读取，用户明确要求轮询类读取不刷日志。
+  router.get("/llm", requireAuth, async (req, res, next) => {
+    try {
+      const serverId = resolveServerId(req.query.serverId, res);
+      if (serverId === null) return;
 
-    const snap = netSnapshot();
-    let uploadBps = 0;
-    let downloadBps = 0;
-    if (snap && prevNet) {
-      const dt = (snap.at - prevNet.at) / 1000;
-      if (dt > 0) {
-        uploadBps = Math.max(0, Math.round((snap.tx - prevNet.tx) / dt));
-        downloadBps = Math.max(0, Math.round((snap.rx - prevNet.rx) / dt));
-      }
+      const refresh = req.query.refresh === "1" || req.query.refresh === "true";
+      const list = await listModels({ refresh });
+      const merged = readMergedConfig();
+      const cur = currentModelInfo();
+      const credentials = readCredentials();
+      const models = (list.models || []).map((m) => ({
+        ...m,
+        isCurrent: Boolean(cur.active) && m.key === cur.active,
+        isRecent: cur.recent.includes(m.key),
+        isFavorite: cur.favorite.includes(m.key),
+      }));
+
+      return ok(res, {
+        serverId,
+        current: {
+          model: cur.configModel,
+          active: cur.active,
+          isGroup: cur.isGroup,
+          resolved: cur.resolved,
+          source: cur.source,
+          sourceFile: cur.sourceFile,
+          recent: cur.recent,
+          favorite: cur.favorite,
+          stateFile: cur.stateFile,
+        },
+        config: {
+          files: cur.files,
+          modelGroups: cur.modelGroups,
+          groupNames: cur.groupNames,
+          customProviders: summarizeProviders(merged.effective),
+        },
+        credentials,
+        providers: [...new Set(models.map((m) => m.providerID))],
+        presets: PROVIDER_PRESETS,
+        adapters: Object.entries(ADAPTERS).map(([npm, v]) => ({ npm, ...v })),
+        models,
+        listError: list.error || null,
+        refreshedAt: naiveOf(),
+      });
+    } catch (e) {
+      next(e);
     }
-    if (snap) prevNet = snap;
+  });
 
-    const latencyMs = readLatencyMs();
-    return ok(res, {
-      serverId,
-      sampledAt: naiveOf(),
-      upload: formatBps(uploadBps),
-      uploadBps,
-      download: formatBps(downloadBps),
-      downloadBps,
-      latencyMs,
-      latencyText: `${latencyMs}ms`,
-    });
+  // POST /api/v1/server/llm/model —— 切换大模型（写回配置顶层 model，校验失败回 400）
+  router.post("/llm/model", requireAuth, async (req, res, next) => {
+    try {
+      const body = req.body ?? {};
+      const serverId = resolveServerId(body.serverId, res);
+      if (serverId === null) return;
+
+      const r = await switchModel(body.model);
+      return ok(res, { serverId, appliedAt: naiveOf(), ...r });
+    } catch (e) {
+      if (e instanceof UsageError) return badRequest(res, e.message);
+      next(e);
+    }
+  });
+
+  // POST /api/v1/server/llm/provider —— 新增大模型（厂商预设 / 自定义端点，写 provider + 可选设为当前）
+  router.post("/llm/provider", requireAuth, async (req, res, next) => {
+    try {
+      const body = req.body ?? {};
+      const serverId = resolveServerId(body.serverId, res);
+      if (serverId === null) return;
+
+      const r = await addProvider(body);
+      return ok(res, { serverId, appliedAt: naiveOf(), ...r });
+    } catch (e) {
+      if (e instanceof UsageError) return badRequest(res, e.message);
+      next(e);
+    }
+  });
+
+  // POST /api/v1/server/llm/provider/remove —— 删除已配置的自定义 provider
+  router.post("/llm/provider/remove", requireAuth, async (req, res, next) => {
+    try {
+      const body = req.body ?? {};
+      const serverId = resolveServerId(body.serverId, res);
+      if (serverId === null) return;
+
+      const r = await removeProvider(body);
+      return ok(res, { serverId, appliedAt: naiveOf(), ...r });
+    } catch (e) {
+      if (e instanceof UsageError) return badRequest(res, e.message);
+      next(e);
+    }
   });
 
   // GET /api/v1/server/logs —— 最近操作记录（页面日志区，limit 默认 5）

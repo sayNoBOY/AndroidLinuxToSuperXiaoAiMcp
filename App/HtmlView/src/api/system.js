@@ -24,11 +24,6 @@ export function getServerMetrics() {
   return api('/server/metrics')
 }
 
-/** GET /server/network — 网络上行/下行/延迟（运行时采样） */
-export function getServerNetwork() {
-  return api('/server/network')
-}
-
 /** GET /server/logs — 最近操作记录（limit 默认 5，result=success|fail 可选） */
 export function getServerLogs({ limit, result } = {}) {
   const qs = new URLSearchParams()
@@ -49,6 +44,26 @@ export function getAllLogs({ page, pageSize, result, keyword, startTime, endTime
   if (endTime) qs.set('endTime', endTime)
   const suffix = qs.toString() ? `?${qs}` : ''
   return api(`/server/logs/all${suffix}`)
+}
+
+/** GET /server/llm — MiMoCode 大模型调用信息（配置文件 / 当前模型 / 模型目录，refresh=1 强制刷新目录） */
+export function getLlmInfo({ refresh } = {}) {
+  return api(`/server/llm${refresh ? '?refresh=1' : ''}`)
+}
+
+/** POST /server/llm/model — 切换大模型（写回 mimocode 配置顶层 model + 运行态 recent） */
+export function switchLlmModel(model) {
+  return api('/server/llm/model', { method: 'POST', body: { serverId: 1, model } })
+}
+
+/** POST /server/llm/provider — 新增大模型 provider（厂商预设 / 自定义端点） */
+export function addLlmProvider(payload) {
+  return api('/server/llm/provider', { method: 'POST', body: { serverId: 1, ...payload } })
+}
+
+/** POST /server/llm/provider/remove — 删除已配置的自定义 provider */
+export function removeLlmProvider(providerId) {
+  return api('/server/llm/provider/remove', { method: 'POST', body: { serverId: 1, providerId } })
 }
 
 /** POST /server/reboot — 重启服务器（页面底部唯一按钮；应用内模拟，约 3 秒恢复） */
