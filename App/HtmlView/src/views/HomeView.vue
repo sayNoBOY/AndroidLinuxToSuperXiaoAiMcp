@@ -3,7 +3,7 @@ import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import {
   listTasks, createTask, getTask, cancelTask, deleteTask,
   getMessages, sendMessage, getArtifacts, artifactUrl, uploadFiles,
-  connectTaskEvents, setEventSeq,
+  getTaskUsage, connectTaskEvents, setEventSeq,
 } from '../api/tasks.js'
 import { MD_RE, renderMarkdown } from '../lib/markdown.js'
 import { push } from '../router.js'
@@ -60,6 +60,73 @@ const isMdExt = (name) => MD_RE.test(name)
 
 // 消息全文弹窗（消息记录里长回复只显示 2 行，点击行查看全部）
 const fullMsg = ref(null)
+
+// 调用统计信息框（点任务卡左侧「模型缩写」图标弹出：每轮对话 token/费用/耗时）
+const usageOpen = ref(false)
+const usageTask = ref(null)
+const usageData = ref(null)
+const usageLoading = ref(false)
+const usageErr = ref('')
+
+async function openUsage(t) {
+  usageTask.value = t
+  usageData.value = null
+  usageErr.value = ''
+  usageOpen.value = true
+  usageLoading.value = true
+  try {
+    usageData.value = await getTaskUsage(t.task_id)
+  } catch (e) {
+    usageErr.value = e?.message || '调用统计加载失败'
+  } finally {
+    usageLoading.value = false
+  }
+}
+
+function closeUsage() {
+  usageOpen.value = false
+  usageTask.value = null
+  usageData.value = null
+  usageErr.value = ''
+}
+
+// WS 事件触发的统计刷新（执行中每轮结束 token 会变，防抖合并）
+let usageTimer = null
+function scheduleUsageRefresh() {
+  clearTimeout(usageTimer)
+  usageTimer = setTimeout(refreshUsage, 500)
+}
+async function refreshUsage() {
+  if (!usageOpen.value || !usageTask.value) return
+  const id = usageTask.value.task_id
+  try {
+    const d = await getTaskUsage(id)
+    if (usageOpen.value && usageTask.value?.task_id === id) usageData.value = d
+  } catch {
+    /* 网络瞬断/框已关：忽略，下次事件再试 */
+  }
+}
+
+// 任务卡图标的模型缩写与悬浮提示
+function abbrOf(t) {
+  return t?.model_abbr || t?.model?.abbr || 'LLM'
+}
+function modelTitle(t) {
+  const m = t?.model
+  const full = m ? `${m.provider_id ? m.provider_id + '/' : ''}${m.model_id}` : '尚未调用大模型'
+  return `当前会话调用大模型：${full}（点击查看调用统计）`
+}
+
+function fmtTok(n) {
+  return (n || 0).toLocaleString('en-US')
+}
+function fmtCost(c) {
+  return c > 0 ? `$${c.toFixed(4)}` : '—'
+}
+function fmtDur(s) {
+  const v = Math.max(0, Math.round(s || 0))
+  return `${p2(Math.floor(v / 60))}:${p2(v % 60)}`
+}
 
 // Toast
 const toastMsg = ref('')
@@ -374,6 +441,7 @@ watch(previewArt, (a) => {
 function onKeydown(e) {
   if (e.key !== 'Escape') return
   if (previewArt.value) return closePreview()
+  if (usageOpen.value) return closeUsage()
   if (fullMsg.value) fullMsg.value = null // 消息全文弹窗（详情弹窗本身不随 Esc 关）
 }
 
@@ -450,6 +518,13 @@ function handleEvent(evt) {
   }
   scheduleReload()
   if (
+    usageOpen.value &&
+    typeof evt.data?.task_id === 'number' &&
+    evt.data.task_id === usageTask.value?.task_id
+  ) {
+    scheduleUsageRefresh()
+  }
+  if (
     detailOpen.value &&
     evt.data?.task_id === detailTask.value?.task_id &&
     (evt.event === 'task_message' ||
@@ -470,6 +545,7 @@ onUnmounted(() => {
   document.removeEventListener('keydown', onKeydown)
   clearTimeout(reloadTimer)
   clearTimeout(detailTimer)
+  clearTimeout(usageTimer)
   stopWs?.()
 })
 </script>
@@ -500,16 +576,23 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- 任务列表 -->
+      <!-- 任务列表（点卡片任意区域弹出详情；操作区/模型图标各自拦截冒泡） -->
       <div id="taskList">
         <div
           v-for="t in visibleTasks"
           :id="'task' + t.task_id"
           :key="t.task_id"
           class="card"
+          @click="openDetail(t)"
         >
           <div class="task-head">
-            <div class="task-ic">{{ t.icon || '📌' }}</div>
+            <!-- 左侧图标 = 当前会话调用大模型的缩写，点击弹出调用统计信息框 -->
+            <button
+              type="button"
+              class="task-ic task-ic--model"
+              :title="modelTitle(t)"
+              @click.stop="openUsage(t)"
+            >{{ abbrOf(t) }}</button>
             <div class="task-main">
               <div class="task-name">{{ t.name }}</div>
               <div class="task-sub">{{ subText(t) }}</div>
@@ -527,7 +610,8 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div class="task-ops">
+          <!-- .stop：按钮各自处理点击，不再冒泡到卡片（避免打开详情叠加触发） -->
+          <div class="task-ops" @click.stop>
             <!-- 左下角：当前轮对话（列表接口的 current_round，新消息经 WS 重拉自动刷新） -->
             <div v-if="t.current_round" class="task-round" :title="t.current_round.content">
               <span class="round-tag" :class="{ pend: t.current_round.pending }">
@@ -655,7 +739,12 @@ onUnmounted(() => {
         <template v-else-if="detailTask">
           <div class="sheet-scroll">
             <div class="detail-head">
-              <div class="task-ic">{{ detailTask.icon || '📌' }}</div>
+              <button
+                type="button"
+                class="task-ic task-ic--model"
+                :title="modelTitle(detailTask)"
+                @click.stop="openUsage(detailTask)"
+              >{{ abbrOf(detailTask) }}</button>
               <div style="flex: 1; min-width: 0">
                 <div class="task-name">{{ detailTask.name }}</div>
                 <div class="task-sub">{{ startText(detailTask) }} · 耗时 {{ durText(detailTask) }}</div>
@@ -772,6 +861,82 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <!-- 调用统计信息框：点任务卡/详情的模型缩写图标弹出（z 60 — 叠在详情 50 之上） -->
+    <div class="overlay usage-overlay" :class="{ show: usageOpen }" @click.self="closeUsage">
+      <div class="sheet sheet--usage">
+        <div class="sheet-head">
+          <h3>调用统计</h3>
+          <button class="close-x" aria-label="关闭" title="关闭" @click="closeUsage">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
+          </button>
+        </div>
+        <div v-if="usageLoading" class="center muted" style="padding: 20px 0">加载中…</div>
+        <div v-else-if="usageErr" class="usage-err">{{ usageErr }}</div>
+        <template v-else-if="usageData">
+          <!-- 当前会话调用的大模型 -->
+          <div class="usage-model">
+            <span class="usage-abbr">{{ usageData.model?.abbr || 'LLM' }}</span>
+            <div class="usage-model-main">
+              <div class="usage-model-id">
+                {{
+                  usageData.model
+                    ? `${usageData.model.provider_id ? usageData.model.provider_id + '/' : ''}${usageData.model.model_id}`
+                    : '尚未调用大模型'
+                }}
+              </div>
+              <div class="muted">当前会话调用大模型 · {{ usageData.session_id || '会话未创建' }}</div>
+            </div>
+          </div>
+
+          <!-- 汇总 -->
+          <div class="usage-grid">
+            <div class="ug"><b>{{ usageData.totals.rounds }}</b><span>轮对话</span></div>
+            <div class="ug"><b>{{ usageData.totals.calls }}</b><span>模型调用</span></div>
+            <div class="ug"><b>{{ fmtTok(usageData.totals.tokens.total) }}</b><span>总 Token</span></div>
+            <div class="ug"><b>{{ fmtCost(usageData.totals.cost) }}</b><span>总费用</span></div>
+          </div>
+          <div class="usage-break muted">
+            输入 {{ fmtTok(usageData.totals.tokens.input) }} · 输出
+            {{ fmtTok(usageData.totals.tokens.output) }} · 推理
+            {{ fmtTok(usageData.totals.tokens.reasoning) }} · 缓存读
+            {{ fmtTok(usageData.totals.tokens.cache_read) }} · 缓存写
+            {{ fmtTok(usageData.totals.tokens.cache_write) }} · 总耗时
+            {{ fmtDur(usageData.totals.duration_sec) }}
+          </div>
+
+          <!-- 每轮对话统计 -->
+          <div class="detail-sub">每轮对话统计</div>
+          <div v-if="!usageData.rounds.length" class="center muted" style="padding: 10px 0">
+            暂无对话记录{{ usageData.session_id ? '' : '（会话尚未创建）' }}
+          </div>
+          <div v-for="r in usageData.rounds" :key="r.round" class="round-card">
+            <div class="rc-head">
+              <span class="rc-no">第 {{ r.round }} 轮</span>
+              <span
+                class="st"
+                :class="{ green: r.status === 'done', blue: r.status === 'running', gray: r.status === 'pending' }"
+              >{{
+                r.status === 'running' ? '执行中' : r.status === 'pending' ? '等待回复' : '已完成'
+              }}</span>
+              <span class="muted rc-time">{{ r.started_at ? r.started_at.slice(5, 16).replace('T', ' ') : '' }}</span>
+            </div>
+            <div v-if="r.preview" class="rc-preview">{{ r.preview }}</div>
+            <div class="rc-stats">
+              <span>调用 {{ r.calls }}</span>
+              <span>Token {{ fmtTok(r.tokens.total) }}</span>
+              <span>入 {{ fmtTok(r.tokens.input) }}</span>
+              <span>出 {{ fmtTok(r.tokens.output) }}</span>
+              <span>推理 {{ fmtTok(r.tokens.reasoning) }}</span>
+              <span>缓存 {{ fmtTok(r.tokens.cache_read + r.tokens.cache_write) }}</span>
+              <span>费用 {{ fmtCost(r.cost) }}</span>
+              <span>耗时 {{ fmtDur(r.duration_sec) }}</span>
+            </div>
+            <div v-if="r.models.length" class="rc-model muted">模型 {{ r.models.join('、') }}</div>
+          </div>
+        </template>
+      </div>
+    </div>
+
     <!-- 产物预览：应用内全屏层（返回按钮回详情，不开新标签页） -->
     <div class="preview-overlay" :class="{ show: !!previewArt }">
       <template v-if="previewArt && detailTask">
@@ -870,7 +1035,11 @@ onUnmounted(() => {
 .content { flex: 1; overflow-y: auto; padding: 8px 14px 20px; -webkit-overflow-scrolling: touch }
 .sect-title { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 700; color: var(--t1); margin: 6px 2px 12px }
 .sect-title .bar { width: 4px; height: 16px; border-radius: 3px }
-.card { background: var(--card); border-radius: var(--radius); padding: 14px; margin-bottom: 12px }
+.card {
+  background: var(--card); border-radius: var(--radius); padding: 14px; margin-bottom: 12px;
+  cursor: pointer; transition: transform 0.12s;
+}
+.card:active { transform: scale(0.985) }
 
 /* ===== 按钮 ===== */
 .btn {
@@ -929,6 +1098,14 @@ onUnmounted(() => {
   width: 40px; height: 40px; border-radius: 11px; background: var(--card2);
   display: flex; align-items: center; justify-content: center; font-size: 19px; flex-shrink: 0;
 }
+/* 任务卡图标 = 会话大模型缩写（点击弹调用统计信息框） */
+.task-ic--model {
+  padding: 0; border: none; cursor: pointer; font-family: inherit;
+  font-size: 11px; font-weight: 800; letter-spacing: 0.3px;
+  color: var(--blue); background: rgba(59, 130, 246, 0.12);
+  transition: 0.15s;
+}
+.task-ic--model:active { transform: scale(0.92) }
 .task-main { flex: 1; min-width: 0 }
 .task-name { font-size: 14px; font-weight: 600; color: var(--t1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
 .task-sub { font-size: 11px; color: var(--t3); margin-top: 2px }
@@ -1099,6 +1276,46 @@ a.btn { text-decoration: none; justify-content: center }
   -webkit-overflow-scrolling: touch; background: var(--card2);
   border: 1px solid var(--line); border-radius: 10px; padding: 12px;
 }
+
+/* ===== 调用统计信息框（模型图标点开） ===== */
+.usage-overlay { z-index: 60 }
+.usage-err { color: var(--red); font-size: 13px; text-align: center; padding: 16px 0 }
+.usage-model {
+  display: flex; align-items: center; gap: 12px; padding: 12px;
+  background: var(--card2); border: 1px solid var(--line);
+  border-radius: 12px; margin-bottom: 12px;
+}
+.usage-abbr {
+  width: 44px; height: 44px; border-radius: 11px; flex-shrink: 0;
+  background: rgba(59, 130, 246, 0.14); color: var(--blue);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 800; letter-spacing: 0.5px;
+}
+.usage-model-main { flex: 1; min-width: 0 }
+.usage-model-id { font-size: 13px; font-weight: 600; color: var(--t1); word-break: break-all }
+.usage-model-main .muted { margin-top: 2px }
+.usage-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px }
+.ug {
+  background: var(--card2); border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 4px; text-align: center;
+}
+.ug b { display: block; font-size: 14px; color: var(--blue); font-weight: 700; word-break: break-all }
+.ug span { font-size: 10.5px; color: var(--t3) }
+.usage-break { text-align: center; font-size: 11px; line-height: 1.6 }
+.round-card {
+  background: var(--card2); border: 1px solid var(--line);
+  border-radius: 10px; padding: 10px; margin-top: 8px;
+}
+.rc-head { display: flex; align-items: center; gap: 8px }
+.rc-no { font-size: 12.5px; font-weight: 700; color: var(--t1) }
+.rc-time { margin-left: auto; font-size: 10.5px }
+.rc-preview {
+  font-size: 11.5px; color: var(--t3); margin-top: 6px;
+  line-height: 1.5; word-break: break-all;
+}
+.rc-stats { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 8px; font-size: 11px; color: var(--t2) }
+.rc-stats span { white-space: nowrap }
+.rc-model { font-size: 10.5px; margin-top: 6px; word-break: break-all }
 
 /* 产物预览全屏层（z 高于详情 overlay=50，低于 toast=99） */
 .preview-overlay {

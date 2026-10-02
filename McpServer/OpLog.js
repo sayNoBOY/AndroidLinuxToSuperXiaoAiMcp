@@ -39,6 +39,7 @@ const ACTION_RULES = [
   { re: /^POST \/api\/v1\/auth\/refresh$/, path: "/api/v1/auth/refresh", action: "刷新访问令牌" },
   { re: /^POST \/api\/v1\/auth\/logout$/, path: "/api/v1/auth/logout", action: "退出登录" },
   { re: /^GET \/api\/v1\/auth\/me$/, path: "/api/v1/auth/me", action: "获取当前用户信息" },
+  { re: /^POST \/api\/v1\/auth\/change-password$/, path: "/api/v1/auth/change-password", action: "修改密码" },
 
   // —— 任务管理（TaskApi /api/v1/tasks）——
   { re: /^GET \/api\/v1\/tasks$/, path: "/api/v1/tasks", action: "查询任务列表" },
@@ -48,6 +49,7 @@ const ACTION_RULES = [
   { re: /^GET \/api\/v1\/tasks\/[^/]+$/, path: "/api/v1/tasks/:taskId", action: "查看任务详情" },
   { re: /^POST \/api\/v1\/tasks\/[^/]+\/send$/, path: "/api/v1/tasks/:taskId/send", action: "发送任务消息" },
   { re: /^GET \/api\/v1\/tasks\/[^/]+\/messages$/, path: "/api/v1/tasks/:taskId/messages", action: "查看消息记录" },
+  { re: /^GET \/api\/v1\/tasks\/[^/]+\/usage$/, path: "/api/v1/tasks/:taskId/usage", action: "查看调用统计" },
   { re: /^PUT \/api\/v1\/tasks\/[^/]+\/cancel$/, path: "/api/v1/tasks/:taskId/cancel", action: "取消任务" },
   { re: /^DELETE \/api\/v1\/tasks\/[^/]+$/, path: "/api/v1/tasks/:taskId", action: "删除任务" },
   { re: /^GET \/api\/v1\/tasks\/[^/]+\/artifacts$/, path: "/api/v1/tasks/:taskId/artifacts", action: "查看任务产物" },

@@ -13,6 +13,10 @@
  *                                        当前轮结束后按序续跑 —— 多轮会话，
  *                                        可携 upload_batch 关联参考物）
  *   GET    /api/v1/tasks/{task_id}/messages  消息历史（pending=1 为排队中）
+ *   GET    /api/v1/tasks/{task_id}/usage     调用统计（每轮对话 token/费用/耗时，只读
+ *                                            mimocode.db 的 message/part 表；列表与详情
+ *                                            同时附 model/model_abbr —— 当前会话调用的
+ *                                            大模型及其缩写，供任务卡图标展示）
  *   PUT    /api/v1/tasks/{task_id}/cancel    取消任务（终止会话并丢弃排队消息，需 Bearer）
  *   DELETE /api/v1/tasks/{task_id}     删除任务（需 Bearer）
  *   DELETE /api/v1/tasks/completed     清空已完成任务（需 Bearer）
@@ -69,6 +73,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { readdir, stat, mkdir, rm, rename, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import express from "express";
 import cors from "cors";
 import {
@@ -78,6 +83,7 @@ import {
   isPrivateOrigin,
   mountLoginApi,
 } from "./LoginApi.js";
+import { currentModelInfo } from "./MiMoCodeConfig.js";
 import { mountOperationLog } from "./OpLog.js";
 import { createNetworkWatcher } from "./NetworkWatch.js";
 
@@ -386,6 +392,279 @@ function rowToApi(row, names, { detail = false } = {}) {
     out.completed_at = row.completed_at ? toISO(row.completed_at) : null;
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// 大模型调用统计：只读 MiMoCode 的 mimocode.db（message/part 表）
+//   - 会话当前模型：取该会话最近一条带 modelID 的助手消息（有索引，极快）
+//   - 每轮统计：user 消息 = 一轮；助手消息按 parentID 归轮（parent 不在本会话
+//     的按时间窗就近归入）；只计 tokens/cost 实际产生用量的消息（占位消息跳过）
+//   - 库不可读时降级：图标回落任务 model / 配置当前模型，usage 返回 503
+// ---------------------------------------------------------------------------
+
+let mimocodeDb = null;
+let mimocodeDbTried = false;
+
+function getMimocodeDb() {
+  if (mimocodeDb || mimocodeDbTried) return mimocodeDb;
+  mimocodeDbTried = true;
+  // 与 MiMoCodeConfig.baseDirs 同口径：MIMOCODE_HOME/data → XDG_DATA_HOME → ~/.local/share
+  const dataDir =
+    process.env.MIMOCODE_HOME && path.isAbsolute(process.env.MIMOCODE_HOME)
+      ? path.join(process.env.MIMOCODE_HOME, "data")
+      : process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+  try {
+    mimocodeDb = new DatabaseSync(path.join(dataDir, "mimocode", "mimocode.db"), {
+      readOnly: true,
+    });
+  } catch (e) {
+    console.error(`[TaskApi] mimocode.db 不可读（${e.message}），调用统计降级`);
+  }
+  return mimocodeDb;
+}
+
+/** 大模型缩写：按 [-_] 分段取首字母，版本段去点保留（mimo-v2.6-flash → MV26F） */
+function modelAbbrOf(modelId) {
+  if (!modelId) return null;
+  const parts = String(modelId).split(/[-_]+/).filter(Boolean);
+  let out = "";
+  for (const p of parts) {
+    if (/^v?\d/i.test(p)) out += p.replace(/\./g, "").toUpperCase();
+    else out += p[0].toUpperCase();
+  }
+  return out.slice(0, 6) || "LLM";
+}
+
+/** "provider/model" → {provider_id, model_id}；无斜杠则整体视为 model_id */
+function splitModelStr(s) {
+  if (!s || typeof s !== "string") return null;
+  const i = s.indexOf("/");
+  return i < 0 ? { provider_id: null, model_id: s } : { provider_id: s.slice(0, i), model_id: s.slice(i + 1) };
+}
+
+// 配置当前模型 10s 缓存（列表逐行兜底时避免重复读配置文件）
+let cfgModelCache = null;
+let cfgModelAt = 0;
+function configModelInfo() {
+  if (!cfgModelCache || Date.now() - cfgModelAt > 10_000) {
+    try {
+      cfgModelCache = splitModelStr(currentModelInfo().active);
+    } catch {
+      cfgModelCache = null;
+    }
+    cfgModelAt = Date.now();
+  }
+  return cfgModelCache;
+}
+
+/** 会话最近一次真实调用的模型（无 session/库不可读/无记录 → null） */
+function latestSessionModel(sessionId) {
+  const mdb = getMimocodeDb();
+  if (!mdb || !sessionId) return null;
+  try {
+    const r = mdb
+      .prepare(
+        "SELECT data FROM message WHERE session_id = ? AND json_extract(data, '$.role') = 'assistant' " +
+          "AND json_extract(data, '$.modelID') IS NOT NULL ORDER BY time_created DESC LIMIT 1"
+      )
+      .get(sessionId);
+    if (!r) return null;
+    const d = JSON.parse(r.data);
+    return { provider_id: d.providerID ?? null, model_id: d.modelID ?? null };
+  } catch {
+    return null;
+  }
+}
+
+/** 任务当前会话调用的大模型：会话实况 → 任务 model 字段 → 全局配置当前模型 */
+function resolveModelInfo(row) {
+  const hit = latestSessionModel(row.session_id) || splitModelStr(row.model) || configModelInfo();
+  if (!hit || (!hit.provider_id && !hit.model_id)) return null;
+  return { ...hit, abbr: modelAbbrOf(hit.model_id) };
+}
+
+/** 把 model / model_abbr 挂到 API 输出对象上（列表与详情共用） */
+function attachModelInfo(out, row) {
+  out.model = resolveModelInfo(row);
+  out.model_abbr = out.model?.abbr ?? null;
+  return out;
+}
+
+const zeroTokens = () => ({ input: 0, output: 0, reasoning: 0, cache_read: 0, cache_write: 0, total: 0 });
+
+function addTokens(dst, tk) {
+  dst.input += tk.input;
+  dst.output += tk.output;
+  dst.reasoning += tk.reasoning;
+  dst.cache_read += tk.cache_read;
+  dst.cache_write += tk.cache_write;
+  dst.total += tk.total;
+  return dst;
+}
+
+// 毫秒时间戳 → 文档口径 ISO 8601 +08:00
+function msToISO(ms) {
+  if (!ms) return null;
+  return toISO(new Date(ms).toISOString().slice(0, 19).replace("T", " "));
+}
+
+/** 轮次输入预览：取应用侧 task_messages 的原文（与消息记录页同源） */
+function roundPreview(content) {
+  return String(content || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
+/**
+ * 任务会话的调用统计：{ model, totals, rounds }。
+ * 轮次口径 = 应用侧 task_messages 的 user 消息（与消息记录页的"轮"一致）；
+ * mimocode 同一条消息可能因断线恢复被重复派发成多条 user 行 —— 按派发时间
+ * 归并回所属应用轮次，助手调用再按 parentID 归轮（parent 缺失按时间就近）。
+ * 无 session 的任务返回全零骨架（图标仍可点开，显示"暂无对话记录"）。
+ */
+function buildSessionUsage(row) {
+  const data = {
+    task_id: row.task_id,
+    session_id: row.session_id ?? null,
+    task_state: row.state,
+    model: resolveModelInfo(row),
+    totals: {
+      rounds: 0,
+      calls: 0,
+      tokens: zeroTokens(),
+      cost: 0,
+      duration_sec: 0,
+      started_at: null,
+      ended_at: null,
+    },
+    rounds: [],
+  };
+  if (!row.session_id) return data;
+  const mdb = getMimocodeDb();
+  if (!mdb) {
+    const e = new Error("MiMoCode 用量库（mimocode.db）不可读");
+    e.status = 503;
+    throw e;
+  }
+
+  // 1) 应用侧轮次边界（user 消息，按 msg_id 升序）
+  const appMsgs = db
+    .prepare(
+      "SELECT content, pending, created_at FROM task_messages " +
+        "WHERE task_id = ? AND role = 'user' ORDER BY msg_id"
+    )
+    .all(row.task_id);
+  const buckets = appMsgs.map((m) => ({
+    t: Date.parse(String(m.created_at).replace(" ", "T") + "Z") || 0,
+    preview: roundPreview(m.content),
+    pending: !!m.pending,
+    calls: [],
+  }));
+  if (!buckets.length) buckets.push({ t: 0, preview: "", pending: false, calls: [] });
+
+  // 2) mimocode 侧：user 消息（重复派发按时间归并到应用轮次）+ 真实助手调用
+  const users = []; // [{id, t, round}]
+  const calls = []; // 真实模型调用（有 token/费用）
+  for (const r of mdb
+    .prepare("SELECT id, data, time_created FROM message WHERE session_id = ? ORDER BY time_created ASC")
+    .all(row.session_id)) {
+    let d;
+    try {
+      d = JSON.parse(r.data);
+    } catch {
+      continue;
+    }
+    if (d.role === "user") {
+      let round = 0;
+      for (let i = 0; i < buckets.length; i++) if (buckets[i].t <= r.time_created) round = i;
+      users.push({ id: r.id, t: r.time_created, round });
+      continue;
+    }
+    if (d.role !== "assistant") continue;
+    const tk = d.tokens || {};
+    const cacheRead = tk.cache?.read ?? 0;
+    const cacheWrite = tk.cache?.write ?? 0;
+    const total =
+      tk.total || (tk.input || 0) + (tk.output || 0) + (tk.reasoning || 0) + cacheRead + cacheWrite;
+    const cost = d.cost || 0;
+    if (!(total > 0 || cost > 0 || (tk.output || 0) > 0)) continue; // 零用量占位消息
+    calls.push({
+      parentID: d.parentID || null,
+      t: r.time_created,
+      end: d.time?.completed || r.time_created,
+      cost,
+      providerID: d.providerID ?? null,
+      modelID: d.modelID ?? null,
+      tokens: {
+        input: tk.input || 0,
+        output: tk.output || 0,
+        reasoning: tk.reasoning || 0,
+        cache_read: cacheRead,
+        cache_write: cacheWrite,
+        total,
+      },
+    });
+  }
+
+  // 3) 助手调用归轮：parentID → 该 mimocode user 消息所属应用轮次；缺失则按时间就近
+  const roundOfMsgId = new Map(users.map((u) => [u.id, u.round]));
+  for (const c of calls) {
+    let idx = c.parentID != null ? roundOfMsgId.get(c.parentID) : undefined;
+    if (idx === undefined) {
+      idx = 0;
+      for (const u of users) if (u.t <= c.t) idx = u.round;
+    }
+    buckets[idx].calls.push(c);
+  }
+
+  let firstMs = null;
+  let lastMs = null;
+  for (let i = 0; i < buckets.length; i++) {
+    const b = buckets[i];
+    const tk = zeroTokens();
+    let cost = 0;
+    let start = null;
+    let end = null;
+    const models = [];
+    for (const c of b.calls) {
+      addTokens(tk, c.tokens);
+      cost += c.cost;
+      start = start == null ? c.t : Math.min(start, c.t);
+      end = end == null ? c.end : Math.max(end, c.end);
+      const name = c.modelID ? `${c.providerID ? c.providerID + "/" : ""}${c.modelID}` : null;
+      if (name && !models.includes(name)) models.push(name);
+    }
+    cost = Math.round(cost * 1e6) / 1e6;
+    const status = !b.calls.length
+      ? "pending"
+      : i === buckets.length - 1 && row.state === "running"
+        ? "running"
+        : "done";
+    data.rounds.push({
+      round: i + 1,
+      preview: b.preview,
+      status, // pending = 已发还没出回复 / running = 本轮执行中 / done
+      calls: b.calls.length,
+      tokens: tk,
+      cost,
+      models,
+      started_at: msToISO(start),
+      ended_at: msToISO(end),
+      duration_sec: start != null && end != null ? Math.max(0, Math.round((end - start) / 1000)) : 0,
+    });
+    if (start != null) firstMs = firstMs == null ? start : Math.min(firstMs, start);
+    if (end != null) lastMs = lastMs == null ? end : Math.max(lastMs, end);
+    addTokens(data.totals.tokens, tk);
+    data.totals.cost += cost;
+    data.totals.calls += b.calls.length;
+  }
+  data.totals.cost = Math.round(data.totals.cost * 1e6) / 1e6;
+  data.totals.rounds = data.rounds.length;
+  data.totals.duration_sec = firstMs != null && lastMs != null ? Math.max(0, Math.round((lastMs - firstMs) / 1000)) : 0;
+  data.totals.started_at = msToISO(firstMs);
+  data.totals.ended_at = msToISO(lastMs);
+  return data;
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,17 +1535,20 @@ export function mountTaskApi(app) {
         const m = latest.get(r.task_id);
         // 列表只作预览，超长内容截断，避免整页响应被长回答撑大
         const content = m && m.content.length > 200 ? m.content.slice(0, 200) + "…" : m?.content;
-        return {
-          ...rowToApi(r, names),
-          current_round: m
-            ? {
-                msg_id: formatMsgId(m.msg_id),
-                role: m.role,
-                content,
-                pending: !!m.pending,
-              }
-            : null,
-        };
+        return attachModelInfo(
+          {
+            ...rowToApi(r, names),
+            current_round: m
+              ? {
+                  msg_id: formatMsgId(m.msg_id),
+                  role: m.role,
+                  content,
+                  pending: !!m.pending,
+                }
+              : null,
+          },
+          r
+        );
       }),
       pagination: { total, page, limit, has_more: offset + rows.length < total },
       // 快照水位：客户端加载完列表后以此为 since 连 WS，重放恰好覆盖加载后的事件
@@ -1404,7 +1686,10 @@ export function mountTaskApi(app) {
     const row = getOwnedTask(taskId, req.user.user_id);
     if (!row) return fail(res, 404, "任务不存在", "TASK_NOT_FOUND");
     const names = deviceNames([row.source_device_id, row.target_device_id]);
-    return ok(res, { ...rowToApi(row, names, { detail: true }), server_seq: maxEventSeq() });
+    return ok(
+      res,
+      attachModelInfo({ ...rowToApi(row, names, { detail: true }), server_seq: maxEventSeq() }, row)
+    );
   });
 
   // POST /api/v1/tasks/{task_id}/send —— 多轮续接（202 受理，不等本轮跑完）
@@ -1519,6 +1804,28 @@ export function mountTaskApi(app) {
         })),
       has_more: hasMore,
     });
+  });
+
+  // GET /api/v1/tasks/{task_id}/usage —— 调用统计（任务卡图标点开的信息框数据源）：
+  // 当前会话调用的大模型 + 汇总 + 每轮对话的 token/费用/耗时（读 mimocode.db，只读不落库）
+  router.get("/tasks/:taskId/usage", requireAuth, (req, res) => {
+    const taskId = asInt(req.params.taskId);
+    if (taskId == null) return badRequest(res, "task_id 无效");
+    const row = getOwnedTask(taskId, req.user.user_id);
+    if (!row) return fail(res, 404, "任务不存在", "TASK_NOT_FOUND");
+    try {
+      const data = buildSessionUsage(row);
+      data.generated_at = nowISO();
+      return ok(res, data);
+    } catch (e) {
+      return fail(
+        res,
+        e.status ?? 500,
+        "调用统计读取失败",
+        e.status === 503 ? "USAGE_DB_UNAVAILABLE" : "USAGE_READ_FAILED",
+        e.message
+      );
+    }
   });
 
   // GET /api/v1/tasks/{task_id}/artifacts —— 产物列表（实时扫描目录并同步表记录）

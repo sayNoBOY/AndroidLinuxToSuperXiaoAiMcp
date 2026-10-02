@@ -126,6 +126,14 @@ export function getArtifacts(taskId) {
 }
 
 /**
+ * GET /tasks/{id}/usage — 调用统计（任务卡模型图标点开的信息框）：
+ * 当前会话调用的大模型 + 汇总 + 每轮对话 token/费用/耗时。
+ */
+export function getTaskUsage(taskId) {
+  return api(`/tasks/${taskId}/usage`)
+}
+
+/**
  * 产物直链（供 <a href> / window.open 使用 —— 请求头带不了 Bearer，
  * 走后端 ?token= 兜底认证）。inline=1 时服务端不加 attachment 头，浏览器直接渲染。
  */
