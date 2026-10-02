@@ -40,7 +40,9 @@
  *    与 getprop ro.soc.model / ro.board.platform；磁盘从 `/`（只读系统分区，手机上恒为系统盘水位）
  *    改为统计 Termux 的 $HOME（App 真正可写存储）；内存改用 /proc/meminfo 的 MemAvailable
  *    （os.freemem() 是 MemFree，忽略页缓存会把占用率虚高到 90%+）；IP 优先取默认路由网卡
- *    （Termux 里 rmnet/tun/dummy 等网卡常排在 wlan0 前面）。
+ *    （Termux 里 rmnet/tun/dummy 等网卡常排在 wlan0 前面）；CPU 核数与使用率 —— SELinux 拒读
+ *    /proc/stat 时 os.cpus() 返回 []（0 核、使用率恒 0），核数改走 /sys online → /proc/cpuinfo →
+ *    availableParallelism 三路兜底，使用率改汇总本进程可见的 /proc/<pid>/stat 差分（口径见下）。
  *
  * 挂载方式：import { mountSysApi } from "./SysApi.js"; mountSysApi(app);
  * 独立运行：node SysApi.js  （会同时挂载登录接口 —— 系统接口依赖其认证）
@@ -251,13 +253,55 @@ function osText() {
   return `${os.type()} ${os.release()}`;
 }
 
+// "0-7" / "0-3,5" 这类 CPU 亲和集字符串 → 核数；解析不了返回 0
+function parseCpuSet(text) {
+  let n = 0;
+  for (const seg of String(text || "").split(",")) {
+    const m = /^(\d+)(?:-(\d+))?$/.exec(seg.trim());
+    if (!m) continue;
+    const a = Number(m[1]);
+    const b = m[2] === undefined ? a : Number(m[2]);
+    if (b >= a) n += b - a + 1;
+  }
+  return n;
+}
+
+// CPU 核数：os.cpus() 内部依赖 /proc/stat，Android 非 root 应用被 SELinux 拒读时返回 []（0 核）。
+// 此时改读实测可读的源；常规 Linux 第一行就短路返回，行为不变。
+function cpuCoreCount() {
+  const fromCpus = os.cpus().length;
+  if (fromCpus > 0) return fromCpus;
+
+  const online = parseCpuSet(readText("/sys/devices/system/cpu/online")); // 例 "0-7" → 8
+  if (online > 0) return online;
+
+  const listed = (readText("/proc/cpuinfo").match(/^processor/gm) || []).length;
+  if (listed > 0) return listed;
+
+  return os.availableParallelism?.() || 1;
+}
+
 // Termux 下 `/` 是只读系统分区（df / 显示的是手机系统盘水位、无意义），统计 App 真正可写的 $HOME
 function diskTarget() {
   return RUNTIME.termux ? process.env.HOME || process.env.PREFIX || "/" : "/";
 }
 
 // 取值函数对外导出：验证脚本注入伪造的 /proc 文本与环境做断言（不新增任何路由/页面字段）
-export { detectRuntimeEnv, osText, cpuBrand, readDisk, readMemory, lanIPv4, diskTarget, defaultRouteIface };
+export {
+  detectRuntimeEnv,
+  osText,
+  cpuBrand,
+  readDisk,
+  readMemory,
+  lanIPv4,
+  diskTarget,
+  defaultRouteIface,
+  cpuCoreCount,
+  parseCpuSet,
+  cpuSnapshot,
+  cpuDiff,
+  readCpuPercent,
+};
 
 // --- 重启：调用仓库根目录 restart.sh（真实重启；脚本 stop_backend 第一步 pkill 本进程） ---
 function launchRestartScript() {
@@ -287,21 +331,66 @@ function launchRestartScript() {
   }
 }
 
-// --- CPU 使用率：两次 os.cpus() 快照差分（首次请求内先隔 CPU_SAMPLE_MS 采一次基线） ---
+// --- CPU 使用率：两次快照差分（首次请求内先隔 CPU_SAMPLE_MS 采一次基线） ---
+// 快照带 mode，两条口径：
+//   "cpus" —— os.cpus() 非空的常规 Linux，times 求和差分（与原实现一致）；
+//   "proc" —— /proc/stat 被 SELinux 拒读（os.cpus() 为 []）时，汇总本 UID 可见进程
+//             /proc/<pid>/stat 的 utime+stime，按 Δticks / (Δ秒 × USER_HZ × 核数) 折算。
+//             口径 = 本服务器（Termux 自身）的 CPU 占用，不是整机全局占用。
+const USER_HZ = 100; // 实测标定：满载子进程 196 ticks / 2.004s ≈ 97.8 → 100 Hz
 let prevCpu = null;
 
-function cpuSnapshot() {
-  let total = 0;
-  let idle = 0;
-  for (const c of os.cpus()) {
-    const t = c.times;
-    total += t.user + t.nice + t.sys + t.idle + t.irq;
-    idle += t.idle;
+// 遍历 /proc/<pid>/stat 累加 utime+stime（单位 tick）。pid 在采样间隙退出/无权限则跳过。
+function procCpuJiffies() {
+  let names;
+  try {
+    names = fs.readdirSync("/proc");
+  } catch {
+    return 0;
   }
-  return { total, idle };
+  let sum = 0;
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      const text = fs.readFileSync(`/proc/${name}/stat`, "utf-8");
+      const close = text.lastIndexOf(")"); // comm 可含空格/括号，以最后一个 ")" 为界
+      if (close < 0) continue;
+      const f = text.slice(close + 2).split(" ");
+      // f[0]=state(字段3)，故 utime=14 → f[11]，stime=15 → f[12]
+      const utime = Number(f[11]);
+      const stime = Number(f[12]);
+      if (Number.isFinite(utime) && Number.isFinite(stime)) sum += utime + stime;
+    } catch {
+      // 进程退出 / 无权限：跳过，不影响其余进程求和
+    }
+  }
+  return sum;
+}
+
+function cpuSnapshot() {
+  const cpus = os.cpus();
+  if (cpus.length > 0) {
+    let total = 0;
+    let idle = 0;
+    for (const c of cpus) {
+      const t = c.times;
+      total += t.user + t.nice + t.sys + t.idle + t.irq;
+      idle += t.idle;
+    }
+    return { mode: "cpus", total, idle, at: Date.now() };
+  }
+  return { mode: "proc", total: procCpuJiffies(), cores: cpuCoreCount(), at: Date.now() };
 }
 
 function cpuDiff(a, b) {
+  if (a.mode !== b.mode) return 0; // 两种口径的数字不能相减
+  if (a.mode === "proc") {
+    const dt = b.total - a.total;
+    const sec = (b.at - a.at) / 1000;
+    const cores = b.cores || a.cores || 1;
+    if (dt <= 0 || sec <= 0) return 0;
+    return Math.max(0, Math.min(100, Math.round((dt / (sec * USER_HZ * cores)) * 100)));
+  }
   const dt = b.total - a.total;
   if (dt <= 0) return 0;
   return Math.max(0, Math.min(100, Math.round((1 - (b.idle - a.idle) / dt) * 100)));
@@ -411,7 +500,7 @@ export function mountSysApi(app) {
     const serverId = resolveServerId(req.query.serverId, res);
     if (serverId === null) return;
 
-    const cores = os.cpus().length;
+    const cores = cpuCoreCount();
     const up = uptimeSeconds();
     return ok(res, {
       serverId,
@@ -435,7 +524,7 @@ export function mountSysApi(app) {
       if (serverId === null) return;
 
       const cpuPercent = await readCpuPercent();
-      const cores = os.cpus().length;
+      const cores = cpuCoreCount();
       const memory = readMemory();
       const disk = readDisk();
 

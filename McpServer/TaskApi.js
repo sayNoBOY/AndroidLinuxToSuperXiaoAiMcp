@@ -403,11 +403,14 @@ function rowToApi(row, names, { detail = false } = {}) {
 // ---------------------------------------------------------------------------
 
 let mimocodeDb = null;
-let mimocodeDbTried = false;
+let mimocodeDbRetryAt = 0; // 替代一次性 mimocodeDbTried：失败后冷却期满自动重试
+const MIMOCODE_DB_RETRY_MS = 5_000; // 失败后 5s 才重试，避免每次请求刷日志
 
 function getMimocodeDb() {
-  if (mimocodeDb || mimocodeDbTried) return mimocodeDb;
-  mimocodeDbTried = true;
+  if (mimocodeDb) return mimocodeDb;
+  const now = Date.now();
+  if (now < mimocodeDbRetryAt) return null; // 冷却期内直接降级，不打日志
+  mimocodeDbRetryAt = now + MIMOCODE_DB_RETRY_MS;
   // 与 MiMoCodeConfig.baseDirs 同口径：MIMOCODE_HOME/data → XDG_DATA_HOME → ~/.local/share
   const dataDir =
     process.env.MIMOCODE_HOME && path.isAbsolute(process.env.MIMOCODE_HOME)
@@ -417,8 +420,11 @@ function getMimocodeDb() {
     mimocodeDb = new DatabaseSync(path.join(dataDir, "mimocode", "mimocode.db"), {
       readOnly: true,
     });
+    console.log("[TaskApi] mimocode.db 已就绪，调用统计可用");
   } catch (e) {
-    console.error(`[TaskApi] mimocode.db 不可读（${e.message}），调用统计降级`);
+    console.error(
+      `[TaskApi] mimocode.db 不可读（${e.message}），调用统计降级（${MIMOCODE_DB_RETRY_MS}ms 后重试）`
+    );
   }
   return mimocodeDb;
 }
@@ -556,7 +562,9 @@ function buildSessionUsage(row) {
     )
     .all(row.task_id);
   const buckets = appMsgs.map((m) => ({
-    t: Date.parse(String(m.created_at).replace(" ", "T") + "Z") || 0,
+    // created_at 由 datetime('now','localtime') 写入 = 本地挂钟时间，按本地解析；
+    // 不能补 "Z" 当 UTC（会多算一个时区偏移，本机 +8h，导致所有调用归到第 1 轮）
+    t: Date.parse(String(m.created_at).replace(" ", "T")) || 0,
     preview: roundPreview(m.content),
     pending: !!m.pending,
     calls: [],
@@ -1852,8 +1860,9 @@ export function mountTaskApi(app) {
     });
   });
 
-  // GET /api/v1/tasks/{task_id}/artifacts/{artifact_id}/download —— 下载（?inline=1 预览，?token= 兜底认证）
-  router.get("/tasks/:taskId/artifacts/:artifactId/download", requireAuthOrToken, async (req, res) => {
+  // GET /api/v1/tasks/{task_id}/artifacts/{artifact_id}/download[/{name}] —— 下载（?inline=1 预览，?token= 兜底认证）
+  // :name 仅作命名提示（按 URL 末段命名的客户端，如 WebView，据此落盘名），不参与文件定位
+  router.get("/tasks/:taskId/artifacts/:artifactId/download{/:name}", requireAuthOrToken, async (req, res) => {
     const taskId = asInt(req.params.taskId);
     const artifactId = asInt(req.params.artifactId);
     if (taskId == null || artifactId == null) return badRequest(res, "id 无效");
@@ -1876,6 +1885,16 @@ export function mountTaskApi(app) {
     if (req.query.inline != null) {
       return res.sendFile(abs); // 内联预览：不带 attachment 头，浏览器按 MIME 渲染
     }
+
+    // 旧链接（无文件名段）302 到带文件名的路径：按 URL 末段命名的客户端（WebView/原生
+    // URLUtil.guessFileName）此前一律落盘为 "download"，重定向后末段即产物名
+    if (!req.params.name) {
+      const path = req.originalUrl.split("?")[0].replace(/\/+$/, "");
+      const qsIdx = req.originalUrl.indexOf("?");
+      const qs = qsIdx >= 0 ? req.originalUrl.slice(qsIdx) : "";
+      return res.redirect(302, `${path}/${encodeURIComponent(rec.filename)}${qs}`);
+    }
+
     res.download(abs, rec.filename, (err) => {
       if (err && !res.headersSent) fail(res, 500, "下载失败", "DOWNLOAD_FAILED", err.message);
     });
