@@ -7,6 +7,7 @@ import {
 } from '../api/tasks.js'
 import { MD_RE, renderMarkdown } from '../lib/markdown.js'
 import { push } from '../router.js'
+import { getLlmInfo } from '../api/system.js'
 
 // 依据 随身互联开发文档/设计/随身互联App四Tab原型(6).html 首页（Tab1 任务中心）实现
 // 数据接 /api/v1/tasks，WS 实时刷新 + since 重放（断联中继）；除首页外的 Tab 仅保留视觉
@@ -142,6 +143,44 @@ function toast(msg) {
 
 function p2(n) {
   return String(n).padStart(2, '0')
+}
+
+// ---------- 大模型就绪提醒（进入任务列表时查一次 GET /server/llm） ----------
+// 触发条件（第 2 轮口径）：① 当前模型为空（current.active 空）→ 弹；
+// ② 当前模型不可用 → 弹：目录里查不到该模型，或其 status !== 'active'
+//    —— 与「我的」大模型卡片的 ✓可用 徽标同一判定（models[].status 来自 `mimo models --verbose`）。
+const OPEN_ADD_LLM_KEY = 'suishen.openAddLlm' // 与 Service.vue 约定：跳到「我的」并直接打开新增大模型弹窗
+const llmNoticeOpen = ref(false)
+const llmNoticeReason = ref('') // 弹窗正文：区分「当前模型为空」与「不可用」两种触发原因
+
+async function checkLlmReady() {
+  try {
+    const d = await getLlmInfo()
+    const active = d?.current?.active || ''
+    if (!active) {
+      llmNoticeReason.value = '尚未配置大模型（当前模型为空），配置后才可以使用任务功能。'
+      llmNoticeOpen.value = true
+      return
+    }
+    const m = (d?.models || []).find((x) => x.key === active)
+    if (!m) {
+      llmNoticeReason.value = `当前大模型 ${active} 不可用：未在模型目录中注册，请重新配置大模型后再使用任务功能。`
+      llmNoticeOpen.value = true
+      return
+    }
+    if (m.status !== 'active') {
+      llmNoticeReason.value = `当前大模型 ${active} 不可用（目录状态：${m.status || '未知'}），请重新配置大模型后再使用任务功能。`
+      llmNoticeOpen.value = true
+    }
+  } catch {
+    /* 读取失败不打扰任务列表，进入页面后仍可正常建任务 */
+  }
+}
+
+function goAddLlm() {
+  llmNoticeOpen.value = false
+  sessionStorage.setItem(OPEN_ADD_LLM_KEY, '1')
+  push('/service')
 }
 
 // ---------- 数据 ----------
@@ -537,6 +576,7 @@ function handleEvent(evt) {
 
 onMounted(async () => {
   document.addEventListener('keydown', onKeydown)
+  checkLlmReady() // 当前模型为空 / 不可用 → 弹窗提醒（不阻塞列表加载）
   await load() // 先拿快照 server_seq，再带 since 连 WS —— 重放恰好覆盖加载后的事件
   stopWs = connectTaskEvents(handleEvent)
 })
@@ -668,13 +708,9 @@ onUnmounted(() => {
         <svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
         <span>首页</span>
       </div>
-      <div class="tab" @click="toast('消息页面开发中，敬请期待')">
-        <svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
-        <span>消息</span>
-      </div>
-      <div class="tab" @click="toast('设备页面开发中，敬请期待')">
-        <svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5"/><rect x="8" y="8" width="8" height="8" rx="2"/></svg>
-        <span>设备</span>
+      <div class="tab" @click="push('/blank')">
+        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+        <span>空白</span>
       </div>
       <div class="tab" @click="push('/service')">
         <svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
@@ -684,6 +720,18 @@ onUnmounted(() => {
 
     <!-- Toast -->
     <div class="toast" :class="{ show: toastMsg }">{{ toastMsg }}</div>
+
+    <!-- 大模型就绪提醒：进入任务列表时，当前模型为空或不可用则弹出，主按钮直达「新增大模型」弹窗 -->
+    <div class="overlay" :class="{ show: llmNoticeOpen }" @click.self="llmNoticeOpen = false">
+      <div class="sheet sheet--llm-notice">
+        <h3>需要配置大模型</h3>
+        <p class="llm-notice-txt">{{ llmNoticeReason }}</p>
+        <div style="display: flex; gap: 10px; margin-top: 16px">
+          <button class="btn line" style="flex: 1; justify-content: center" @click="llmNoticeOpen = false">稍后再说</button>
+          <button class="btn primary" style="flex: 1; justify-content: center" @click="goAddLlm">去配置大模型</button>
+        </div>
+      </div>
+    </div>
 
     <!-- 新建任务弹窗 -->
     <div class="overlay" :class="{ show: newOpen }" @click.self="newOpen = false">
@@ -813,7 +861,7 @@ onUnmounted(() => {
               <a
                 class="btn sm green"
                 :href="artifactUrl(detailTask.task_id, a.artifact_id)"
-                download
+                :download="a.filename"
               >下载</a>
             </div>
           </div>
@@ -956,7 +1004,7 @@ onUnmounted(() => {
               @click="mdMode = 'source'"
             >源码</button>
           </span>
-          <a class="btn sm green" :href="artifactUrl(detailTask.task_id, previewArt.artifact_id)" download>下载</a>
+          <a class="btn sm green" :href="artifactUrl(detailTask.task_id, previewArt.artifact_id)" :download="previewArt.filename">下载</a>
         </div>
         <div class="preview-body" :class="{ 'md-body': isMdExt(previewArt.filename) }" @click.self="closePreview">
           <!-- Markdown：前端渲染成文档（标题/表格/列表/代码高亮/图片内链…） -->
@@ -1151,6 +1199,9 @@ onUnmounted(() => {
 }
 .overlay.show .sheet { transform: translateY(0) }
 .sheet h3 { font-size: 16px; font-weight: 700; margin-bottom: 14px; color: var(--t1) }
+
+/* 大模型就绪提醒弹窗：正文（为空/不可用两种原因）+ 双按钮（去配置大模型 → 跳「我的」并打开新增弹窗） */
+.llm-notice-txt { font-size: 13px; line-height: 1.7; color: var(--t2); margin: 0 }
 
 /* 任务详情弹窗：标题行 + 滚动内容 + 底部固定「继续对话」 */
 .sheet--detail {

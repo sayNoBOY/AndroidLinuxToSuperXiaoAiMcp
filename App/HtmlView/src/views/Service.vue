@@ -63,6 +63,9 @@ const diskText = computed(() => {
   return d ? `${d.percent}% · ${d.usedGb}/${d.totalGb} GB` : '—'
 })
 
+// 当前服务访问地址：本页前端实际访问的 origin（hash 路由不计入地址，局域网/localhost 随打开方式变化）
+const frontendAddr = window.location.origin || '—'
+
 // 进度条配色随水位变化（演示值 32/68/45 对应 绿/黄/绿，与原型一致）
 function barColor(p) {
   if (p >= 85) return 'var(--red)'
@@ -270,6 +273,15 @@ const llmProviders = computed(() => llm.value?.providers || [])
 const llmGroups = computed(() => llm.value?.config?.groupNames || [])
 const llmCreds = computed(() => llm.value?.credentials || [])
 
+// MiMoCode 内置默认 provider（mimo / xiaomi 目录随包自带，无需任何配置就会出现在模型目录里）：
+// 未在本应用「新增大模型」配置过时不算已配置，切换弹窗里清掉这些默认选项——
+// 否则空配置也满屏可选模型，容易误导用户以为大模型已经配置好了。
+const BUILTIN_DEFAULT_PROVIDERS = ['mimo', 'xiaomi']
+const configuredProviderIds = computed(() => (llm.value?.config?.customProviders || []).map((p) => p.id))
+function isBuiltinDefaultProvider(providerID) {
+  return BUILTIN_DEFAULT_PROVIDERS.includes(providerID) && !configuredProviderIds.value.includes(providerID)
+}
+
 /** token 计数用十进制后缀，与 `mimo models` 输出口径一致（1M / 1.05M / 944K） */
 function fmtTokens(n) {
   if (n === null || n === undefined) return '—'
@@ -344,14 +356,27 @@ const swSwitching = ref(false)
 const swRefreshing = ref(false)
 const swError = ref('')
 
-/** 关键字 + 提供商过滤后的可选模型 */
+/** 关键字 + 提供商过滤后的可选模型（内置默认 provider 未配置时不在其中） */
+const swProviders = computed(() => llmProviders.value.filter((p) => !isBuiltinDefaultProvider(p)))
 const swModels = computed(() => {
   const kw = swKeyword.value.trim().toLowerCase()
   return llmModels.value.filter((m) => {
+    if (isBuiltinDefaultProvider(m.providerID)) return false
     if (swProvider.value && m.providerID !== swProvider.value) return false
     if (!kw) return true
     return `${m.key} ${m.name} ${m.providerID}`.toLowerCase().includes(kw)
   })
+})
+/** 目录里有模型、但清掉内置默认项后一个不剩（无关键字/筛选）→ 换成「先去新增」的提示 */
+const swAllHidden = computed(
+  () => !swModels.value.length && llmModels.value.length > 0 && !swKeyword.value.trim() && !swProvider.value,
+)
+/** 弹窗「当前模型」：当前值是被清掉的内置默认项时标成未配置，避免看着像已配置 */
+const swCurText = computed(() => {
+  const k = activeKey.value
+  if (!k) return '未配置'
+  const provider = k.includes('/') ? k.split('/')[0] : ''
+  return isBuiltinDefaultProvider(provider) ? `未配置（MiMoCode 内置默认 ${k}）` : k
 })
 const swSelectedModel = computed(() => llmModels.value.find((m) => m.key === swSelected.value) || null)
 const swIsGroup = computed(() => Boolean(swSelected.value) && !swSelected.value.includes('/'))
@@ -364,7 +389,9 @@ function openSwitcher() {
   swOpen.value = true
   swKeyword.value = ''
   swProvider.value = ''
-  swSelected.value = activeKey.value || ''
+  // 当前模型是被清掉的内置默认项时不留选中态（否则详情区仍展示它，像已配置）
+  const activeProvider = activeKey.value.includes('/') ? activeKey.value.split('/')[0] : ''
+  swSelected.value = isBuiltinDefaultProvider(activeProvider) ? '' : activeKey.value || ''
   swError.value = ''
   loadLlm({ refresh: true })
 }
@@ -425,6 +452,10 @@ const adAdapters = computed(() => llm.value?.adapters || [{ npm: '@ai-sdk/openai
 /** 已配置的自定义 provider（可删）与内置目录 provider（只读展示） */
 const adCustom = computed(() => llm.value?.config?.customProviders || [])
 const adCatalog = computed(() => llm.value?.providers || [])
+/** 「已接入」目录区展示：去掉内置默认 mimo / xiaomi —— 零配置它们也在目录里，摆出来会让人误以为已接入 */
+const adExistCatalog = computed(() =>
+  adCatalog.value.filter((p) => !BUILTIN_DEFAULT_PROVIDERS.includes(p)),
+)
 /** 当前填写的 providerId 是否命中内置目录（会并入其既有模型并共用新 baseURL） */
 const adIsCatalog = computed(() => adCatalog.value.includes(adForm.value.providerId.trim()))
 /** 目录里该 provider 的既有模型 key（提示用，最多列 4 个） */
@@ -436,7 +467,10 @@ const adCanSubmit = computed(() =>
   adForm.value.providerId && adForm.value.npm && adForm.value.baseURL && adForm.value.modelId,
 )
 
-function openAdder() {
+// 任务列表提醒弹窗「去配置大模型」写入的跳转标记（与 HomeView.vue 约定，用一次即清）
+const OPEN_ADD_LLM_KEY = 'suishen.openAddLlm'
+
+async function openAdder() {
   if (rebooting.value) return
   adOpen.value = true
   adError.value = ''
@@ -444,7 +478,11 @@ function openAdder() {
   adPresetId.value = ''
   adConfirmDel.value = ''
   adForm.value = blankAddForm()
-  if (!llm.value) loadLlm()
+  // 预设来自 GET /server/llm：首开（如任务中心跳转过来时）可能还没数据，先等一次再带出
+  if (!llm.value) await loadLlm()
+  // 默认选中 MiMo 预设（字段均可改）；后端万一没有该预设则退回空白自定义表单
+  const mimo = adPresets.value.find((p) => p.id === 'mimo')
+  if (mimo) applyPreset(mimo)
 }
 
 function closeAdder() {
@@ -615,6 +653,11 @@ onMounted(async () => {
   } else {
     await refreshAll()
   }
+  // 任务列表「去配置大模型」跳转过来：直接打开新增大模型弹窗（标记用一次即清）
+  if (sessionStorage.getItem(OPEN_ADD_LLM_KEY)) {
+    sessionStorage.removeItem(OPEN_ADD_LLM_KEY)
+    openAdder()
+  }
   // 常态轮询：status/metrics 每 10s（文档口径 5~10s；留痕由服务端 7 天策略控制）；
   // llm 同频刷新但不进 loading（服务端模型目录 60s 缓存，接口耗时可忽略）
   pollTimer = setInterval(() => {
@@ -667,6 +710,7 @@ onUnmounted(() => {
           <span class="k">CPU 核心</span>
           <span class="v">{{ status ? `${status.cpuCores} 核 ${status.cpuModel}` : '—' }}</span>
         </div>
+        <div class="kv"><span class="k">当前服务访问地址</span><span class="v">{{ frontendAddr }}</span></div>
       </div>
 
       <!-- CPU / 内存 / 磁盘 -->
@@ -807,13 +851,9 @@ onUnmounted(() => {
         <svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg>
         <span>首页</span>
       </div>
-      <div class="tab" @click="toast('消息页面开发中，敬请期待')">
-        <svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></svg>
-        <span>消息</span>
-      </div>
-      <div class="tab" @click="toast('设备页面开发中，敬请期待')">
-        <svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" /><rect x="8" y="8" width="8" height="8" rx="2" /></svg>
-        <span>设备</span>
+      <div class="tab" @click="push('/blank')">
+        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg>
+        <span>空白</span>
       </div>
       <div class="tab on">
         <svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></svg>
@@ -885,7 +925,7 @@ onUnmounted(() => {
         <div class="sw-cur">
           <div class="sw-cur-main">
             <div class="sw-cur-l">当前模型</div>
-            <div class="sw-cur-v">{{ activeKey || 'MiMoCode 默认' }}</div>
+            <div class="sw-cur-v">{{ swCurText }}</div>
             <div class="sw-file">{{ llmSourceText }}</div>
           </div>
           <button class="btn sm line" :disabled="swRefreshing" @click="refreshCatalog">
@@ -899,7 +939,7 @@ onUnmounted(() => {
         <div class="tabs3">
           <div class="tab3" :class="{ on: swProvider === '' }" @click="swProvider = ''">全部</div>
           <div
-            v-for="p in llmProviders" :key="p"
+            v-for="p in swProviders" :key="p"
             class="tab3" :class="{ on: swProvider === p }"
             @click="swProvider = p"
           >{{ p }}</div>
@@ -916,7 +956,9 @@ onUnmounted(() => {
 
         <div class="log-scroll sw-list">
           <div v-if="llmLoading && !llmModels.length" class="center muted" style="padding: 20px 0">模型加载中…</div>
-          <div v-else-if="!swModels.length" class="center muted" style="padding: 20px 0">无匹配的模型</div>
+          <div v-else-if="!swModels.length" class="center muted" style="padding: 20px 0">
+            {{ swAllHidden ? '暂无已配置的大模型（MiMoCode 内置的 mimo / xiaomi 默认项已隐藏），请先「新增大模型」' : '无匹配的模型' }}
+          </div>
           <label
             v-for="m in swModels" :key="m.key"
             class="sw-item" :class="{ on: swSelected === m.key, cur: m.key === activeKey }"
@@ -977,10 +1019,10 @@ onUnmounted(() => {
           </button>
         </div>
 
-        <!-- 已接入：目录 provider 只读，自定义 provider 可删 -->
-        <div v-if="adCatalog.length || adCustom.length" class="ad-exist">
+        <!-- 已接入：目录 provider 只读（内置默认 mimo/xiaomi 已去掉），自定义 provider 可删 -->
+        <div v-if="adExistCatalog.length || adCustom.length" class="ad-exist">
           <span class="ad-lab">已接入</span>
-          <span v-for="p in adCatalog" :key="'c' + p" class="ad-chip">{{ p }}</span>
+          <span v-for="p in adExistCatalog" :key="'c' + p" class="ad-chip">{{ p }}</span>
           <span v-for="p in adCustom" :key="'u' + p.id" class="ad-chip own">
             {{ p.id }}<em>{{ p.modelCount }} 模型</em>
             <button
