@@ -32,6 +32,7 @@ const REFRESH_TTL_SEC = 30 * 24 * 3600; // 文档：refresh_token 30 天
 const MAX_LOGIN_FAILURES = 5; // 文档 3.5：连续 5 次密码错误
 const LOCK_MINUTES = 15; // 锁定 15 分钟
 const SINGLE_DEVICE_LOGIN = process.env.SINGLE_DEVICE_LOGIN === "1";
+const MIN_PASSWORD_LEN = 6; // 修改密码：新密码最短长度
 
 // ---------------------------------------------------------------------------
 // 通用响应结构：{ code, message, data, timestamp } / 错误 { code, message, error }
@@ -450,6 +451,40 @@ export function mountLoginApi(app) {
   // GET /api/v1/auth/me
   router.get("/me", requireAuth, (req, res) => {
     return ok(res, publicUser(req.user));
+  });
+
+  // POST /api/v1/auth/change-password —— 修改登录密码（需 Bearer；新密码二次确认）
+  router.post("/change-password", requireAuth, (req, res) => {
+    const { currentPassword, newPassword, confirmPassword } = req.body ?? {};
+    if (
+      typeof currentPassword !== "string" || !currentPassword ||
+      typeof newPassword !== "string" || !newPassword
+    ) {
+      return badRequest(res, "currentPassword 与 newPassword 为必填字段");
+    }
+    if (typeof confirmPassword !== "string" || !confirmPassword) {
+      return badRequest(res, "confirmPassword 为必填字段（新密码二次确认）");
+    }
+    if (newPassword !== confirmPassword) {
+      return fail(res, 400, "两次输入的新密码不一致", "PASSWORD_MISMATCH");
+    }
+    if (newPassword.length < MIN_PASSWORD_LEN) {
+      return fail(res, 400, `新密码长度至少 ${MIN_PASSWORD_LEN} 位`, "WEAK_PASSWORD");
+    }
+    if (newPassword === currentPassword) {
+      return badRequest(res, "新密码不能与当前密码相同");
+    }
+    if (!verifyPassword(currentPassword, req.user.password_hash)) {
+      return fail(res, 401, "当前密码错误", "INVALID_CREDENTIALS");
+    }
+
+    database
+      .prepare(
+        "UPDATE users SET password_hash = ?, failed_attempts = 0, locked_until = NULL, updated_at = datetime('now','localtime') WHERE user_id = ?"
+      )
+      .run(hashPassword(newPassword), req.user.user_id);
+
+    return ok(res, { user_id: req.user.user_id, username: req.user.username, updated: true });
   });
 
   router.use((err, req, res, _next) => {

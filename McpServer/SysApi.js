@@ -34,14 +34,22 @@
  *    在序列化时转换。
  * 4. status/metrics 为 10s 轮询，**不写**操作日志（OpLog 的规则表已剔除，
  *    否则打开「我的」页日志区全是"查看服务器状态"）；留痕只覆盖查日志/重启等主动操作。
+ * 5. Termux / Android 环境适配：普通 Linux 的取值方式在手机 Termux 里全是错的，逐项换源 ——
+ *    操作系统 `Linux <内核>` → `Android <版本> (Termux)`（getprop / build.prop）；CPU 型号在
+ *    os.cpus() 只给 "unknown"（arm64 无 model name）时改读 /proc/cpuinfo 的 Hardware/Processor
+ *    与 getprop ro.soc.model / ro.board.platform；磁盘从 `/`（只读系统分区，手机上恒为系统盘水位）
+ *    改为统计 Termux 的 $HOME（App 真正可写存储）；内存改用 /proc/meminfo 的 MemAvailable
+ *    （os.freemem() 是 MemFree，忽略页缓存会把占用率虚高到 90%+）；IP 优先取默认路由网卡
+ *    （Termux 里 rmnet/tun/dummy 等网卡常排在 wlan0 前面）。
  *
  * 挂载方式：import { mountSysApi } from "./SysApi.js"; mountSysApi(app);
  * 独立运行：node SysApi.js  （会同时挂载登录接口 —— 系统接口依赖其认证）
  */
 import os from "node:os";
 import path from "node:path";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { execSync, spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import express from "express";
 import cors from "cors";
 import { getDb, requireAuth, isPrivateOrigin, mountLoginApi } from "./LoginApi.js";
@@ -127,28 +135,129 @@ function fmtUptime(sec) {
   return `${d}天 ${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Termux / Android 环境适配：同一台"服务器"在 PC Linux 与手机 Termux 里的取值来源不同
+// ---------------------------------------------------------------------------
+
+function readText(file) {
+  try {
+    return fs.readFileSync(file, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+// Android 系统属性：getprop（Termux 的 PATH 含 /system/bin）→ /system/build.prop，取不到返回 ""
+function getProp(key) {
+  for (const bin of ["getprop", "/system/bin/getprop"]) {
+    try {
+      const out = execFileSync(bin, [key], {
+        encoding: "utf-8",
+        timeout: 1500,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      if (out) return out;
+    } catch {
+      // 命令不存在 / 无权限：换下一个来源
+    }
+  }
+  const line = readText("/system/build.prop")
+    .split("\n")
+    .find((l) => l.startsWith(`${key}=`));
+  return line ? line.slice(key.length + 1).trim() : "";
+}
+
+// 运行环境探测：TERMUX_VERSION / PREFIX 含 com.termux 判 Termux；能取到 Android 版本判 Android
+function detectRuntimeEnv() {
+  const termux = Boolean(process.env.TERMUX_VERSION) || (process.env.PREFIX || "").includes("com.termux");
+  const release = getProp("ro.build.version.release");
+  return { termux, android: termux || Boolean(release), release };
+}
+const RUNTIME = detectRuntimeEnv(); // 有进程调用，启动探一次即可
+
+// /proc/net/route：目的地址 00000000 且 UP 的默认路由，取 metric 最小那条的网卡；读不到返回 ""
+function defaultRouteIface(routeText = readText("/proc/net/route")) {
+  let best = null;
+  for (const line of routeText.split("\n").slice(1)) {
+    const p = line.trim().split(/\s+/);
+    if (p.length < 7 || p[1] !== "00000000") continue;
+    if (!(parseInt(p[3], 16) & 0x1)) continue; // RTF_UP
+    const metric = Number(p[6]) || 0;
+    if (!best || metric < best.metric) best = { iface: p[0], metric };
+  }
+  return best?.iface || "";
+}
+
 function lanIPv4() {
   if (process.env.SYS_IP) return process.env.SYS_IP;
   const ifs = os.networkInterfaces();
-  for (const list of Object.values(ifs)) {
-    for (const it of list || []) {
-      if (!it.internal && it.family === "IPv4") return it.address;
+  const names = Object.keys(ifs);
+  // 默认路由网卡优先：Termux 里 rmnet/tun/dummy 等非业务网卡常排在 wlan0 前面被误取
+  const prefer = defaultRouteIface();
+  const order = prefer && names.includes(prefer) ? [prefer, ...names.filter((n) => n !== prefer)] : names;
+  for (const name of order) {
+    for (const it of ifs[name] || []) {
+      if (!it.internal && (it.family === "IPv4" || it.family === 4)) return it.address;
     }
   }
   return "127.0.0.1";
 }
 
-function cpuBrand() {
-  const model = os.cpus()[0]?.model?.trim();
-  if (!model) return "CPU";
-  const first = model.split(/\s+/)[0].replace(/[()]/g, "");
-  return first || "CPU";
+// /proc/cpuinfo 字段：x86 有 model name；arm64 只有 Hardware / CPU part，32 位 ARM 另有 Processor
+function cpuinfoField(text, key) {
+  const m = new RegExp(`^${key}\\s*:\\s*(.+)$`, "m").exec(text || "");
+  return m ? m[1].trim() : "";
+}
+
+// 型号串 → 展示用短名：ARM 无型号串取首词（"ARMv8 Processor rev 1" → "ARMv8"，与旧口径一致）；
+// 带厂商逗号的 SoC 串取末词（"Qualcomm Technologies, Inc SM8250" → "SM8250"）
+const CPU_UNKNOWN = new Set(["", "unknown", "not spec", "n/a", "none", "-", "common"]);
+
+function brandOf(raw) {
+  const t = String(raw || "").replace(/\s+/g, " ").trim();
+  if (!t || CPU_UNKNOWN.has(t.toLowerCase())) return "";
+  const tail = t.includes(",") ? t.split(",").pop().trim() : t;
+  const word = t.includes(",") ? tail.split(/\s+/).pop() : tail.split(/\s+/)[0];
+  return (word || "").replace(/[()]/g, "");
+}
+
+// SoC 型号兜底（arm64 常无 model name）：ro.soc.model（Android 12+）→ ro.board.platform，缓存一次
+let socBrandCache;
+function socBrand() {
+  if (socBrandCache === undefined) {
+    socBrandCache = brandOf(getProp("ro.soc.model")) || brandOf(getProp("ro.board.platform")) || "";
+  }
+  return socBrandCache;
+}
+
+function cpuBrand(cpuinfo = readText("/proc/cpuinfo")) {
+  if (process.env.SYS_CPU) return process.env.SYS_CPU;
+  const found =
+    brandOf(os.cpus()[0]?.model) ||
+    brandOf(cpuinfoField(cpuinfo, "model name")) ||
+    brandOf(cpuinfoField(cpuinfo, "Hardware")) ||
+    brandOf(cpuinfoField(cpuinfo, "Processor")) ||
+    brandOf(cpuinfoField(cpuinfo, "Model")) ||
+    (RUNTIME.android ? socBrand() : "");
+  return found || "未知型号";
 }
 
 function osText() {
   if (process.env.SYS_OS) return process.env.SYS_OS;
+  if (RUNTIME.android) {
+    const ver = RUNTIME.release ? `Android ${RUNTIME.release}` : "Android";
+    return RUNTIME.termux ? `${ver} (Termux)` : ver;
+  }
   return `${os.type()} ${os.release()}`;
 }
+
+// Termux 下 `/` 是只读系统分区（df / 显示的是手机系统盘水位、无意义），统计 App 真正可写的 $HOME
+function diskTarget() {
+  return RUNTIME.termux ? process.env.HOME || process.env.PREFIX || "/" : "/";
+}
+
+// 取值函数对外导出：验证脚本注入伪造的 /proc 文本与环境做断言（不新增任何路由/页面字段）
+export { detectRuntimeEnv, osText, cpuBrand, readDisk, readMemory, lanIPv4, diskTarget, defaultRouteIface };
 
 // --- 重启：调用仓库根目录 restart.sh（真实重启；脚本 stop_backend 第一步 pkill 本进程） ---
 function launchRestartScript() {
@@ -211,10 +320,10 @@ async function readCpuPercent() {
   return cpuDiff(first, second);
 }
 
-// --- 磁盘：df -kP /（Linux/Android 可用；失败时返回 0 兜底） ---
+// --- 磁盘：df -kP <磁盘根>（Linux/Termux 可用；失败时返回 0 兜底） ---
 function readDisk() {
   try {
-    const out = execSync("df -kP /", { encoding: "utf-8", timeout: 2000 });
+    const out = execFileSync("df", ["-kP", diskTarget()], { encoding: "utf-8", timeout: 2000 });
     const line = out.trim().split("\n")[1] || "";
     const parts = line.split(/\s+/);
     const totalKb = Number(parts[1]);
@@ -228,6 +337,32 @@ function readDisk() {
   } catch {
     return { percent: 0, usedGb: 0, totalGb: 0 };
   }
+}
+
+// --- 内存：/proc/meminfo 的 MemAvailable（真正可回收的可用内存）；读不到时退回 os.freemem() ---
+// os.freemem() 取的是 MemFree，忽略页缓存，Linux/Android 上会把占用率虚高到 90%+
+function readMemory(meminfo = readText("/proc/meminfo")) {
+  const kbOf = (key) => {
+    const m = new RegExp(`^${key}:\\s+(\\d+) kB$`, "m").exec(meminfo);
+    return m ? Number(m[1]) : 0;
+  };
+  const totalKb = kbOf("MemTotal");
+  const availKb = kbOf("MemAvailable");
+  if (totalKb > 0 && availKb > 0) {
+    const usedKb = Math.max(0, totalKb - availKb);
+    return {
+      percent: Math.min(100, Math.round((usedKb / totalKb) * 100)),
+      usedGb: Math.round((usedKb / 1048576) * 10) / 10,
+      totalGb: Math.round((totalKb / 1048576) * 10) / 10,
+    };
+  }
+  const total = os.totalmem();
+  const free = os.freemem();
+  return {
+    percent: total > 0 ? Math.round(((total - free) / total) * 100) : 0,
+    usedGb: Math.round(((total - free) / 1073741824) * 10) / 10,
+    totalGb: Math.round((total / 1073741824) * 10) / 10,
+  };
 }
 
 // operation_log 的建表/种子/清理与全局留痕中间件在 OpLog.js，这里只保留读取连接
@@ -301,20 +436,14 @@ export function mountSysApi(app) {
 
       const cpuPercent = await readCpuPercent();
       const cores = os.cpus().length;
-      const totalMem = os.totalmem();
-      const freeMem = os.freemem();
-      const memPercent = totalMem > 0 ? Math.round(((totalMem - freeMem) / totalMem) * 100) : 0;
+      const memory = readMemory();
       const disk = readDisk();
 
       return ok(res, {
         serverId,
         sampledAt: naiveOf(),
         cpu: { percent: cpuPercent, cores, model: `${cores}核心 ${cpuBrand()}` },
-        memory: {
-          percent: memPercent,
-          usedGb: Math.round(((totalMem - freeMem) / 1073741824) * 10) / 10,
-          totalGb: Math.round((totalMem / 1073741824) * 10) / 10,
-        },
+        memory,
         disk: { percent: disk.percent, usedGb: disk.usedGb, totalGb: disk.totalGb },
       });
     } catch (e) {

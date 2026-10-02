@@ -4,8 +4,11 @@ import { login } from '../api/auth.js'
 import { push } from '../router.js'
 
 // 依据 随身互联开发文档/设计/登录页/登录页.html 移植，接真实 /api/v1/auth 接口
-const username = ref('')
-const password = ref('')
+// 默认账号来自 LoginApi.js 初始化的管理员（密码可用 ADMIN_PASSWORD 覆盖）
+const DEFAULT_USERNAME = 'admin'
+const DEFAULT_PASSWORD = 'admin123'
+const username = ref(DEFAULT_USERNAME)
+const password = ref(DEFAULT_PASSWORD)
 const remember = ref(true)
 const showPwd = ref(false)
 const loading = ref(false)
@@ -59,8 +62,8 @@ onMounted(() => {
     <!-- Logo -->
     <div class="brand">
       <div class="brand-icon">🔗</div>
-      <h1>随身互联</h1>
-      <p>局域网设备互联管理系统</p>
+      <h1>智衍</h1>
+      <p>无限自进化，随你所想</p>
     </div>
 
     <!-- 表单 -->
@@ -107,6 +110,10 @@ onMounted(() => {
           <div class="spinner"></div>
           <div class="shine"></div>
         </button>
+
+        <div class="default-hint">
+          默认账号：{{ DEFAULT_USERNAME }}　默认密码：{{ DEFAULT_PASSWORD }}
+        </div>
       </form>
     </div>
 
@@ -252,6 +259,13 @@ onMounted(() => {
 }
 .btn-primary.loading .spinner { display: block }
 @keyframes spin { to { transform: rotate(360deg) } }
+
+/* 默认账号提示 */
+.default-hint {
+  margin-top: 14px; text-align: center; font-size: 12px; color: var(--t3);
+  background: var(--card2); border: 1px dashed var(--line);
+  border-radius: 8px; padding: 8px 10px; letter-spacing: .3px;
+}
 
 /* ========== 底部 ========== */
 .footer {

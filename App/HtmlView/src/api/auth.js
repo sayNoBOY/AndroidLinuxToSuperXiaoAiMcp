@@ -134,3 +134,21 @@ export async function logout() {
   }
   clearTokens()
 }
+
+/** POST /auth/change-password — 修改登录密码（需 Bearer，新密码需二次确认；过期自动刷新一次） */
+export async function changePassword(currentPassword, newPassword, confirmPassword) {
+  const body = { currentPassword, newPassword, confirmPassword }
+  const call = (token) => request('/auth/change-password', { method: 'POST', body, token })
+  const token = getToken()
+  if (!token) {
+    const err = new Error('未登录')
+    err.type = 'MISSING_TOKEN'
+    throw err
+  }
+  try {
+    return await call(token)
+  } catch (e) {
+    if (e.type === 'AUTH_EXPIRED' && (await tryRefresh())) return await call(getToken())
+    throw e
+  }
+}

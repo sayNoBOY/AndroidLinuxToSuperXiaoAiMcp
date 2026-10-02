@@ -6,6 +6,7 @@ import {
   getServerLogs, getAllLogs, rebootServer,
   getLlmInfo, switchLlmModel, addLlmProvider, removeLlmProvider,
 } from '../api/system.js'
+import { changePassword } from '../api/auth.js'
 
 // 依据 随身互联App四Tab原型(6).html Tab4「我的」实现，接口对接 SysApi.js：
 //   status / metrics 10s 轮询（文档口径 5~10s），logs 首次 + 重启完成时刷新，
@@ -514,6 +515,94 @@ async function removeProvider(id) {
   }
 }
 
+// ---------- 修改登录密码弹窗（POST /auth/change-password：当前密码 + 新密码二次确认） ----------
+const PWD_MIN_LEN = 6
+const pwdOpen = ref(false)
+const pwdSaving = ref(false)
+const pwdError = ref('')
+const pwdForm = ref({ current: '', next: '', confirm: '' })
+const pwdShow = ref({ current: false, next: false, confirm: false })
+
+/** 确认框已填但与新密码不一致：实时提示（提交按钮本身也要求一致才可点） */
+const pwdMismatch = computed(
+  () => pwdForm.value.confirm.length > 0 && pwdForm.value.next !== pwdForm.value.confirm,
+)
+const pwdCanSubmit = computed(
+  () =>
+    !pwdSaving.value &&
+    pwdForm.value.current.length > 0 &&
+    pwdForm.value.next.length >= PWD_MIN_LEN &&
+    pwdForm.value.next === pwdForm.value.confirm,
+)
+
+function openPwd() {
+  if (rebooting.value) return
+  pwdOpen.value = true
+  pwdError.value = ''
+  pwdForm.value = { current: '', next: '', confirm: '' }
+  pwdShow.value = { current: false, next: false, confirm: false }
+}
+
+function closePwd() {
+  if (pwdSaving.value) return
+  pwdOpen.value = false
+}
+
+async function submitPwd() {
+  if (!pwdCanSubmit.value) return
+  pwdSaving.value = true
+  pwdError.value = ''
+  try {
+    await changePassword(pwdForm.value.current, pwdForm.value.next, pwdForm.value.confirm)
+    pwdOpen.value = false
+    pwdForm.value = { current: '', next: '', confirm: '' }
+    toast('登录密码修改成功 ✓')
+  } catch (e) {
+    pwdError.value = e?.message || '修改失败'
+  } finally {
+    pwdSaving.value = false
+  }
+}
+
+// ---------- 关于软件信息弹窗 ----------
+// 作者/社交账号按用户要求固定展示；开源仓库取自本仓库 git remote（gitee）；
+// 打包信息取自任务 73「termux打包问题」的构建产物（智衍 SelfEvolution APK）。
+const aboutOpen = ref(false)
+
+const ABOUT_AUTHOR = Object.freeze({
+  author: '老实人留一手',
+  douyin: '老实人留一手',
+  bilibili: '老实人留一手',
+})
+
+const ABOUT_REPO = Object.freeze({
+  name: 'android-linux-to-super-xiao-ai-mcp',
+  url: 'https://gitee.com/liuchunwei123/android-linux-to-super-xiao-ai-mcp',
+  ssh: 'git@gitee.com:liuchunwei123/android-linux-to-super-xiao-ai-mcp.git',
+  license: 'MIT License',
+  branch: 'dev',
+})
+
+// 任务 73（taskRes/73/智衍SelfEvolution构建报告.md，aapt2/apksigner 实测口径）
+const ABOUT_PKG = Object.freeze([
+  { k: '打包任务', v: '#73 termux打包问题' },
+  { k: '应用名称', v: '智衍 SelfEvolution' },
+  { k: '包名', v: 'com.termux' },
+  { k: '版本', v: 'versionName 0.118.0-se1 · versionCode 20260930' },
+  { k: 'APK', v: 'SelfEvolution-v0.118.0-se1-universal.apk（212,071,601 字节 ≈ 202 MB）' },
+  { k: '签名', v: 'CN=SelfEvolution, OU=SE, O=SelfEvolution, C=CN' },
+  { k: 'SDK', v: 'minSdk 21 · targetSdk 28 · compileSdk 36' },
+  { k: '构建日期', v: '2026-09-30' },
+])
+
+function openAbout() {
+  if (rebooting.value) return
+  aboutOpen.value = true
+}
+function closeAbout() {
+  aboutOpen.value = false
+}
+
 // ---------- 生命周期 ----------
 let pollTimer = null
 let tickTimer = null
@@ -684,10 +773,27 @@ onUnmounted(() => {
         <button class="more-btn" @click="openLogs">查看全部日志</button>
       </div>
 
-      <!-- 操作按钮：只保留重启服务器（切换/新增大模型已移入上方信息模块，查看日志入口 = 「查看全部日志」） -->
+      <!-- 操作按钮：修改密码 + 重启服务器（切换/新增大模型在上方信息模块，查看日志入口 = 「查看全部日志」） -->
       <div class="conn">
-        <button class="btn red" style="flex: 1" :disabled="rebooting" @click="reboot">
+        <button class="btn line" :disabled="rebooting" @click="openPwd">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="11" width="18" height="10" rx="2" />
+            <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+          </svg>
+          修改密码
+        </button>
+        <button class="btn red" :disabled="rebooting" @click="reboot">
           {{ rebooting ? '重启中…' : '重启服务器' }}
+        </button>
+      </div>
+      <!-- 关于软件信息：位于重启服务器按钮正下方，点开弹窗（作者/账号/开源仓库/任务73打包信息） -->
+      <div class="conn">
+        <button class="btn line" :disabled="rebooting" @click="openAbout">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 16v-4M12 8h.01" />
+          </svg>
+          关于软件信息
         </button>
       </div>
       <div class="center muted" style="padding-top: 12px">
@@ -893,7 +999,7 @@ onUnmounted(() => {
               class="ad-preset" :class="{ on: adPresetId === p.id }"
               :disabled="adSaving" type="button" @click="applyPreset(p)"
             >
-              <b>{{ p.label }}</b><i>{{ p.vendor }}</i>
+              <b>{{ p.label }}</b>
             </button>
           </div>
         </div>
@@ -964,6 +1070,116 @@ onUnmounted(() => {
         <div class="sw-note">
           预设 baseURL 为厂商公开端点、模型 ID 为可编辑示例（以厂商文档为准）；密钥明文写入 mimocode 配置，
           也可用 <b>{env:VAR}</b> 引用环境变量。写回后新会话生效。
+        </div>
+      </div>
+    </div>
+
+    <!-- 修改登录密码弹层（POST /auth/change-password：校验当前密码 + 新密码二次确认） -->
+    <div class="overlay" :class="{ show: pwdOpen }" @click.self="closePwd">
+      <div class="sheet sheet--pwd">
+        <div class="sheet-head">
+          <h3>修改密码</h3>
+          <button class="close-x" aria-label="关闭" title="关闭" :disabled="pwdSaving" @click="closePwd">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
+          </button>
+        </div>
+
+        <div class="pwd-form">
+          <label class="ad-field">
+            <span>当前密码</span>
+            <div class="ad-key">
+              <input
+                v-model="pwdForm.current" class="input"
+                :type="pwdShow.current ? 'text' : 'password'"
+                :disabled="pwdSaving" autocomplete="current-password"
+                placeholder="请输入当前登录密码"
+              />
+              <button class="ad-eye" type="button" @click="pwdShow.current = !pwdShow.current">
+                {{ pwdShow.current ? '隐藏' : '显示' }}
+              </button>
+            </div>
+          </label>
+
+          <label class="ad-field">
+            <span>新密码</span>
+            <div class="ad-key">
+              <input
+                v-model="pwdForm.next" class="input"
+                :type="pwdShow.next ? 'text' : 'password'"
+                :disabled="pwdSaving" autocomplete="new-password"
+                :placeholder="`至少 ${PWD_MIN_LEN} 位`"
+              />
+              <button class="ad-eye" type="button" @click="pwdShow.next = !pwdShow.next">
+                {{ pwdShow.next ? '隐藏' : '显示' }}
+              </button>
+            </div>
+          </label>
+
+          <label class="ad-field">
+            <span>确认新密码</span>
+            <div class="ad-key">
+              <input
+                v-model="pwdForm.confirm" class="input"
+                :type="pwdShow.confirm ? 'text' : 'password'"
+                :disabled="pwdSaving" autocomplete="new-password"
+                placeholder="请再次输入新密码"
+                @keydown.enter="submitPwd"
+              />
+              <button class="ad-eye" type="button" @click="pwdShow.confirm = !pwdShow.confirm">
+                {{ pwdShow.confirm ? '隐藏' : '显示' }}
+              </button>
+            </div>
+            <em v-if="pwdMismatch" class="pwd-err">两次输入的新密码不一致</em>
+          </label>
+
+          <em class="pwd-hint">新密码至少 {{ PWD_MIN_LEN }} 位，且不能与当前密码相同；修改成功后请使用新密码登录。</em>
+        </div>
+
+        <div v-if="pwdError" class="llm-warn">{{ pwdError }}</div>
+
+        <div class="sw-foot">
+          <button class="btn line" :disabled="pwdSaving" @click="closePwd">取消</button>
+          <button class="btn primary" :disabled="!pwdCanSubmit" @click="submitPwd">
+            {{ pwdSaving ? '提交中…' : '确认修改' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 关于软件信息弹层（软件作者/抖音/B站 + 当前 git 仓库开源信息 + 任务 73 打包信息） -->
+    <div class="overlay" :class="{ show: aboutOpen }" @click.self="closeAbout">
+      <div class="sheet sheet--about">
+        <div class="sheet-head">
+          <h3>关于软件信息</h3>
+          <button class="close-x" aria-label="关闭" title="关闭" @click="closeAbout">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
+          </button>
+        </div>
+
+        <div class="about-body">
+          <div class="about-sec">软件信息</div>
+          <div class="kv"><span class="k">软件作者</span><span class="v">{{ ABOUT_AUTHOR.author }}</span></div>
+          <div class="kv"><span class="k">抖音账号</span><span class="v">{{ ABOUT_AUTHOR.douyin }}</span></div>
+          <div class="kv"><span class="k">b站账号</span><span class="v">{{ ABOUT_AUTHOR.bilibili }}</span></div>
+
+          <div class="about-sec">开源仓库</div>
+          <div class="kv"><span class="k">仓库名称</span><span class="v">{{ ABOUT_REPO.name }}</span></div>
+          <div class="kv">
+            <span class="k">仓库地址</span>
+            <a class="v about-link" :href="ABOUT_REPO.url" target="_blank" rel="noopener">{{ ABOUT_REPO.url }}</a>
+          </div>
+          <div class="kv"><span class="k">SSH 地址</span><span class="v">{{ ABOUT_REPO.ssh }}</span></div>
+          <div class="kv"><span class="k">开源协议</span><span class="v">{{ ABOUT_REPO.license }}</span></div>
+          <div class="kv"><span class="k">当前分支</span><span class="v">{{ ABOUT_REPO.branch }}</span></div>
+
+          <div class="about-sec">打包信息<span class="about-sec-src">来源：任务 73</span></div>
+          <div v-for="row in ABOUT_PKG" :key="row.k" class="kv">
+            <span class="k">{{ row.k }}</span><span class="v">{{ row.v }}</span>
+          </div>
+        </div>
+
+        <div class="sw-foot">
+          <button class="btn line" @click="closeAbout">关闭</button>
         </div>
       </div>
     </div>
@@ -1279,12 +1495,11 @@ onUnmounted(() => {
 .ad-sec { margin-top: 12px; flex-shrink: 0 }
 .ad-presets { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 7px }
 .ad-preset {
-  display: flex; flex-direction: column; gap: 2px; padding: 7px 10px; border-radius: 10px;
+  display: flex; align-items: center; padding: 6px 10px; border-radius: 10px;
   border: 1px solid var(--line); background: var(--card); cursor: pointer;
   transition: 0.15s; font-family: inherit; text-align: left;
 }
 .ad-preset b { font-size: 12.5px; color: var(--t1); font-weight: 700 }
-.ad-preset i { font-style: normal; font-size: 9.5px; color: var(--t3) }
 .ad-preset.on { border-color: var(--purple); background: rgba(168, 85, 247, 0.12) }
 .ad-preset.on b { color: var(--purple) }
 .ad-preset:active { transform: scale(0.97) }
@@ -1312,5 +1527,25 @@ onUnmounted(() => {
 }
 .ad-check input { width: 15px; height: 15px; margin-top: 1px; accent-color: var(--purple); flex-shrink: 0 }
 .ad-check span { flex: 1 }
+
+/* ===== 修改密码弹层（当前密码 + 新密码二次确认） ===== */
+.pwd-form { display: flex; flex-direction: column; gap: 10px; padding-top: 14px; flex-shrink: 0 }
+.pwd-err { font-style: normal; font-size: 10.5px; color: var(--red) }
+.pwd-hint {
+  font-style: normal; font-size: 10.5px; line-height: 1.55; color: var(--t3);
+  background: var(--card2); padding: 7px 9px; border-radius: 8px;
+}
+.sheet--pwd .sw-foot { margin-top: 4px }
+
+/* ===== 关于软件信息弹层 ===== */
+.about-body { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; padding-top: 6px }
+.about-sec {
+  font-size: 11px; font-weight: 700; color: var(--t3); letter-spacing: 0.4em;
+  margin: 14px 0 4px; display: flex; align-items: baseline; justify-content: space-between;
+}
+.about-sec:first-child { margin-top: 6px }
+.about-sec-src { font-weight: 500; letter-spacing: 0; color: var(--t3); opacity: 0.75 }
+.about-link { color: var(--blue); text-decoration: none; font-weight: 500 }
+.sheet--about .sw-foot { margin-top: 12px }
 
 </style>
