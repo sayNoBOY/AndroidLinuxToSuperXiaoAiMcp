@@ -283,10 +283,6 @@ function subText(t) {
 }
 
 // ---------- 操作 ----------
-function pauseStub() {
-  toast('任务暂不支持暂停，可先取消')
-}
-
 async function onCancel(t) {
   try {
     await cancelTask(t.task_id)
@@ -708,7 +704,6 @@ onUnmounted(() => {
             </div>
             <template v-if="t.state === 'running'">
               <button class="btn sm line" @click="openDetail(t)">查看详情</button>
-              <button class="btn sm line" @click="pauseStub">暂停</button>
               <button class="btn sm red" @click="onCancel(t)">取消</button>
             </template>
             <template v-else-if="t.state === 'queued'">

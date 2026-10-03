@@ -4,7 +4,8 @@
  * 覆盖本服务**所有业务接口**（登录认证 / 任务管理 / 参考物上传 / MCP / 系统操作），
  * 在应用层挂 res 'finish' 中间件统一留痕：动作（action）按「方法 + 路径」识别成
  * 中文功能名（见 ACTION_RULES），响应后异步写入 operation_log；读取端在 SysApi。
- * 例外：「我的」页 10s 轮询的 status/metrics 与大模型信息读取 llm 不记录（打开页面即刷屏）。
+ * 例外：「我的」页 10s 轮询的 status/metrics、大模型信息读取 llm 与任务详情每秒轮询的
+ * checkpoint 不记录（打开页面/跑任务即刷屏）。
  *
  * 路由识别用 `METHOD + originalUrl(去query)` 对有序正则表匹配 —— 不依赖
  * req.route / req.baseUrl（路由分发结束后 baseUrl 可能已被回收，finish 时取值不稳）。
@@ -50,7 +51,8 @@ const ACTION_RULES = [
   { re: /^POST \/api\/v1\/tasks\/[^/]+\/send$/, path: "/api/v1/tasks/:taskId/send", action: "发送任务消息" },
   { re: /^GET \/api\/v1\/tasks\/[^/]+\/messages$/, path: "/api/v1/tasks/:taskId/messages", action: "查看消息记录" },
   { re: /^GET \/api\/v1\/tasks\/[^/]+\/usage$/, path: "/api/v1/tasks/:taskId/usage", action: "查看调用统计" },
-  { re: /^GET \/api\/v1\/tasks\/[^/]+\/checkpoint$/, path: "/api/v1/tasks/:taskId/checkpoint", action: "查看会话checkpoint" },
+  // /tasks/:taskId/checkpoint 是任务详情「执行中」区每秒轮询的读取接口，
+  // 与 status/metrics 同规则不记（否则任务一跑日志即刷屏）。
   { re: /^PUT \/api\/v1\/tasks\/[^/]+\/cancel$/, path: "/api/v1/tasks/:taskId/cancel", action: "取消任务" },
   { re: /^DELETE \/api\/v1\/tasks\/[^/]+$/, path: "/api/v1/tasks/:taskId", action: "删除任务" },
   { re: /^GET \/api\/v1\/tasks\/[^/]+\/artifacts$/, path: "/api/v1/tasks/:taskId/artifacts", action: "查看任务产物" },

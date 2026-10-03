@@ -623,7 +623,7 @@ async function submitPwd() {
 
 // ---------- 关于软件信息弹窗 ----------
 // 作者/社交账号按用户要求固定展示；开源仓库取自本仓库 git remote（gitee）；
-// 打包信息取自任务 73「termux打包问题」的构建产物（智衍 SelfEvolution APK）。
+// 打包信息取自任务 84「重打包」的最终构建产物（智衍 SelfEvolution APK，终版 se6）。
 const aboutOpen = ref(false)
 
 const ABOUT_AUTHOR = Object.freeze({
@@ -640,16 +640,16 @@ const ABOUT_REPO = Object.freeze({
   branch: 'dev',
 })
 
-// 任务 73（taskRes/73/智衍SelfEvolution构建报告.md，aapt2/apksigner 实测口径）
+// 任务 84（taskRes/84/打包验证记录.txt + 任务报告.md，aapt2/apksigner 实测口径，终版 se6）
 const ABOUT_PKG = Object.freeze([
-  { k: '打包任务', v: '#73 termux打包问题' },
+  { k: '打包任务', v: '#84 重打包（73号修复 · 终版 se6）' },
   { k: '应用名称', v: '智衍 SelfEvolution' },
   { k: '包名', v: 'com.termux' },
-  { k: '版本', v: 'versionName 0.118.0-se1 · versionCode 20260930' },
-  { k: 'APK', v: 'SelfEvolution-v0.118.0-se1-universal.apk（212,071,601 字节 ≈ 202 MB）' },
+  { k: '版本', v: 'versionName 0.118.0-se6 · versionCode 20261002' },
+  { k: 'APK', v: 'SelfEvolution-v0.118.0-se6-universal.apk（211,900,357 字节 ≈ 202 MB）' },
   { k: '签名', v: 'CN=SelfEvolution, OU=SE, O=SelfEvolution, C=CN' },
   { k: 'SDK', v: 'minSdk 21 · targetSdk 28 · compileSdk 36' },
-  { k: '构建日期', v: '2026-09-30' },
+  { k: '构建日期', v: '2026-10-03' },
 ])
 
 function openAbout() {
@@ -849,7 +849,7 @@ onUnmounted(() => {
           {{ rebooting ? '重启中…' : '重启服务器' }}
         </button>
       </div>
-      <!-- 关于软件信息：位于重启服务器按钮正下方，点开弹窗（作者/账号/开源仓库/任务73打包信息） -->
+      <!-- 关于软件信息：位于重启服务器按钮正下方，点开弹窗（作者/账号/开源仓库/任务84打包信息） -->
       <div class="conn">
         <button class="btn line" :disabled="rebooting" @click="openAbout">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1228,7 +1228,7 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 关于软件信息弹层（软件作者/抖音/B站 + 当前 git 仓库开源信息 + 任务 73 打包信息） -->
+    <!-- 关于软件信息弹层（软件作者/抖音/B站 + 当前 git 仓库开源信息 + 任务 84 打包信息） -->
     <div class="overlay" :class="{ show: aboutOpen }" @click.self="closeAbout">
       <div class="sheet sheet--about">
         <div class="sheet-head">
@@ -1254,7 +1254,7 @@ onUnmounted(() => {
           <div class="kv"><span class="k">开源协议</span><span class="v">{{ ABOUT_REPO.license }}</span></div>
           <div class="kv"><span class="k">当前分支</span><span class="v">{{ ABOUT_REPO.branch }}</span></div>
 
-          <div class="about-sec">打包信息<span class="about-sec-src">来源：任务 73</span></div>
+          <div class="about-sec">打包信息<span class="about-sec-src">来源：任务 84</span></div>
           <div v-for="row in ABOUT_PKG" :key="row.k" class="kv">
             <span class="k">{{ row.k }}</span><span class="v">{{ row.v }}</span>
           </div>
