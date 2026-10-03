@@ -20,9 +20,10 @@
  *   PUT    /api/v1/tasks/{task_id}/cancel    取消任务（终止会话并丢弃排队消息，需 Bearer）
  *   DELETE /api/v1/tasks/{task_id}     删除任务（需 Bearer）
  *   DELETE /api/v1/tasks/completed     清空已完成任务（需 Bearer）
- *   GET    /api/v1/tasks/{task_id}/checkpoint  会话 checkpoint 尾部两行（任务详情「执行中」
- *                                            区每秒轮询；checkpoint.md 由 MiMoCode 的
- *                                            checkpoint writer 维护在 memory/sessions/<sid>/）
+ *   GET    /api/v1/tasks/{task_id}/checkpoint  会话 checkpoint 文件全文（任务详情「执行中」
+ *                                            区每秒轮询；前端从最后一行往上显示并限两行；
+ *                                            checkpoint.md 由 MiMoCode 的 checkpoint writer
+ *                                            维护在 memory/sessions/<sid>/）
  *   GET    /api/v1/tasks/{task_id}/artifacts  产物列表（扫描 taskRes/<id>/ 并同步表记录）
  *   GET    /api/v1/tasks/{task_id}/artifacts/{artifact_id}/download
  *           下载产物（附件下载；?inline=1 按内联预览；?token= 允许无 Authorization 头）
@@ -1850,9 +1851,9 @@ export function mountTaskApi(app) {
     }
   });
 
-  // GET /api/v1/tasks/{task_id}/checkpoint —— 会话 checkpoint 文件尾部（详情弹窗「执行中」区
+  // GET /api/v1/tasks/{task_id}/checkpoint —— 会话 checkpoint 文件全文（详情弹窗「执行中」区
   // 每秒轮询）。文件 = <dataDir>/mimocode/memory/sessions/<session_id>/checkpoint.md（与
-  // getMimocodeDb 同口径的 dataDir）；只回最后 2 条非空行 —— 前端限定两行展示，避免整文件每秒回传。
+  // getMimocodeDb 同口径的 dataDir）；行序由前端反转（从最后一行往上显示）并限两行展示。
   router.get("/tasks/:taskId/checkpoint", requireAuth, async (req, res) => {
     const taskId = asInt(req.params.taskId);
     if (taskId == null) return badRequest(res, "task_id 无效");
@@ -1871,15 +1872,10 @@ export function mountTaskApi(app) {
 
     try {
       const [text, st] = await Promise.all([readFile(file, "utf8"), stat(file).catch(() => null)]);
-      const lines = text
-        .split(/\r?\n/)
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .slice(-2);
       return ok(res, {
         task_id: taskId,
         exists: true,
-        content: lines.join("\n"),
+        content: text, // 全文：界面从最后一行往上显示并限两行（反转在前端做）
         updated_at: st
           ? toISO(new Date(st.mtimeMs).toISOString().slice(0, 19).replace("T", " "))
           : null,

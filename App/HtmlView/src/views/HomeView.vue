@@ -54,9 +54,14 @@ const currentInstruction = computed(() => {
   return lastUser?.content || detailTask.value?.message || '—'
 })
 
-// 执行中的任务：每秒拉一次会话 checkpoint 文件尾部（2 行展示）
+// 执行中的任务：每秒拉一次会话检查点文件全文（界面从最后一行往上显示、限两行）
 const detailCheckpoint = ref('')
 let ckptTimer = null
+
+/** 全文 → 从最后一行往上排（丢掉空行，别让它们占掉两行限高的位置） */
+const ckptReversed = computed(() =>
+  detailCheckpoint.value.split(/\r?\n/).filter((l) => l.trim()).reverse().join('\n')
+)
 
 async function fetchCheckpoint() {
   const t = detailTask.value
@@ -851,11 +856,11 @@ onUnmounted(() => {
               <span class="k">错误信息</span><span class="v" style="color: var(--red)">{{ detailTask.error_message }}</span>
             </div>
             <div class="kv"><span class="k">当前指令</span><span class="v" style="max-width: 65%; text-align: right">{{ currentInstruction }}</span></div>
-            <!-- 执行中：会话 checkpoint 文件尾部（限高两行，每秒拉最新内容） -->
+            <!-- 执行中：会话检查点全文，从最后一行往上显示（限高两行，每秒拉最新内容） -->
             <div v-if="detailTask.state === 'running'" class="kv kv--ckpt">
-              <span class="k">checkpoint</span>
-              <span class="v ckpt-box" :title="detailCheckpoint || '暂无 checkpoint 内容'">
-                {{ detailCheckpoint || '暂无 checkpoint 内容（写入后每秒自动刷新）' }}
+              <span class="k">检查点</span>
+              <span class="v ckpt-box" :title="ckptReversed || '暂无检查点内容'">
+                {{ ckptReversed || '暂无检查点内容（写入后每秒自动刷新）' }}
               </span>
             </div>
 
@@ -1303,14 +1308,16 @@ onUnmounted(() => {
 .kv:last-child { border-bottom: none }
 .kv .k { color: var(--t3); flex-shrink: 0; margin-right: 12px }
 .kv .v { color: var(--t1); font-weight: 500; word-break: break-all }
-/* 执行中的 checkpoint：文件尾部两行，限高 + 超长截断（每秒轮询刷新） */
+/* 执行中的检查点：全文反转后从最后一行往上显示，一行 = 文件一行（不折行，超宽截断），
+   限高两行；每秒轮询刷新 */
 .kv--ckpt { align-items: flex-start }
 .ckpt-box {
-  flex: 1; min-width: 0; max-width: 75%; text-align: right;
+  flex: 1; min-width: 0; max-width: 75%; text-align: left;
   font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.5;
-  color: var(--t2); font-weight: 400; white-space: pre-wrap;
+  color: var(--t2); font-weight: 400; white-space: pre;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-  overflow: hidden; max-height: calc(2 * 1.5 * 11px); /* clamp 不生效时兜底也只占两行 */
+  overflow: hidden; text-overflow: ellipsis;
+  max-height: calc(2 * 1.5 * 11px); /* clamp 不生效时兜底也只占两行 */
 }
 
 /* 详情弹层（沿用原型 detail-panel / kv 设计语言） */

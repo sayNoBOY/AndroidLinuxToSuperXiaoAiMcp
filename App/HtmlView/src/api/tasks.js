@@ -134,8 +134,9 @@ export function getTaskUsage(taskId) {
 }
 
 /**
- * GET /tasks/{id}/checkpoint — 会话 checkpoint 尾部两行（仅任务执行中时前端每秒轮询）。
- * 返回 { exists, content, updated_at }；还没写过 checkpoint 时 exists=false、content=''。
+ * GET /tasks/{id}/checkpoint — 会话 checkpoint 文件全文（仅任务执行中时前端每秒轮询，
+ * 界面从最后一行往上显示、限两行）。返回 { exists, content, updated_at }；文件还没写过时
+ * exists=false、content=''。
  */
 export function getTaskCheckpoint(taskId) {
   return api(`/tasks/${taskId}/checkpoint`)
