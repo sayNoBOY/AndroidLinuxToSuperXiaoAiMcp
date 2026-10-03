@@ -73,6 +73,7 @@ const ACTION_RULES = [
   { re: /^POST \/api\/v1\/server\/llm\/model$/, path: "/api/v1/server/llm/model", action: "切换大模型" },
   { re: /^POST \/api\/v1\/server\/llm\/provider$/, path: "/api/v1/server/llm/provider", action: "新增大模型" },
   { re: /^POST \/api\/v1\/server\/llm\/provider\/remove$/, path: "/api/v1/server/llm/provider/remove", action: "删除大模型" },
+  { re: /^POST \/api\/v1\/server\/llm\/model\/capabilities$/, path: "/api/v1/server/llm/model/capabilities", action: "初始化模型能力" },
 
   // —— MCP（POST /mcp：动作按 JSON-RPC 方法/工具动态识别，见 mcpAction）——
   { re: /^POST \/mcp$/, path: "/mcp", action: null },

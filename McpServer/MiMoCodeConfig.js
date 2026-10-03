@@ -11,6 +11,9 @@
  * 切换：把顶层 `model` 定点写进**优先级最高且已存在**的配置文件（JSONC 注释原样保留），
  *       并按官方约定把目标模型插到 state/model.json 的 recent 首位（去重、上限 10）。
  *
+ * 能力：添加模型/能力再初始化时按 user > existing > catalog(仅内置) > probe > preset > default
+ *       流水线解析并写入 modalities（识图等）——修复「初次添加大模型不识别识图能力」。
+ *
  * 安全：模型/凭据 DTO 全部走白名单字段，CLI 的 options/headers 与 auth.json 的 key 不落响应。
  */
 import fs from "node:fs";
@@ -529,6 +532,215 @@ export async function verifyModelRegistered(providerID, modelID) {
 }
 
 // ---------------------------------------------------------------------------
+// 模型能力初始化（modalities）——修复：初次添加大模型未识别识图能力
+//   流水线：user > catalog > probe > existing > preset > default
+// ---------------------------------------------------------------------------
+
+const MODALITY_ENUM = ["text", "audio", "image", "video", "pdf"];
+const PROBE_TIMEOUT_MS = 8000;
+const PROBE_CACHE_TTL_MS = 10 * 60 * 1000;
+const probeCache = new Map();
+
+/** 来源 → 中文（note 展示） */
+const CAP_SOURCE_CN = {
+  user: "用户指定",
+  catalog: "模型目录",
+  probe: "实测",
+  existing: "沿用已有配置",
+  preset: "预设名单",
+  default: "默认纯文本",
+};
+
+/**
+ * modalities 写前校验（$schema 实测约束）：对象、input/output 均为非空数组、
+ * 值限枚举、无额外键。不合法宁可不写（只保留 name）——写错会让整份配置校验失败。
+ */
+export function validateModalities(m) {
+  if (!isPlainObj(m)) return false;
+  if (!Object.keys(m).every((k) => k === "input" || k === "output")) return false;
+  for (const k of ["input", "output"]) {
+    const arr = m[k];
+    if (!Array.isArray(arr) || arr.length === 0) return false;
+    if (!arr.every((x) => typeof x === "string" && MODALITY_ENUM.includes(x))) return false;
+  }
+  return true;
+}
+
+/** capabilities 里的 {text:true,image:false,…} 映射 → 数组；无 true 项返回 null */
+function modalityList(map) {
+  if (!isPlainObj(map)) return null;
+  const list = MODALITY_ENUM.filter((k) => map[k] === true);
+  return list.length ? list : null;
+}
+
+/** `mimo models --verbose` 的 capabilities → modalities；形状不符返回 null（不猜） */
+export function modalitiesFromCatalogCapabilities(caps) {
+  if (!isPlainObj(caps)) return null;
+  const m = { input: modalityList(caps.input), output: modalityList(caps.output) };
+  if (!m.input || !m.output) return null;
+  return validateModalities(m) ? m : null;
+}
+
+/** 识图预设正向名单——宁缺勿滥：只收确定支持图片输入的模型 */
+const VISION_MODEL_RE =
+  /^(gpt-4o|gpt-4\.1|gpt-5|claude-[a-z0-9.-]*?(?:sonnet|opus|haiku)|gemini-|qwen-vl|qwen\d+-vl|glm-4v|mimo-v2\.6|grok-2-vision|.*-vision)/i;
+
+/** 请求体显式能力入参：modalities 全量 或 vision 布尔简写；非法入参抛 UsageError(400) */
+function parseRequestedModalities(input) {
+  if (input.modalities !== undefined && input.modalities !== null) {
+    if (!validateModalities(input.modalities)) {
+      throw new UsageError("modalities 需为对象，input/output 均为非空数组，取值限 text/audio/image/video/pdf");
+    }
+    return input.modalities;
+  }
+  if (input.vision !== undefined && input.vision !== null) {
+    if (typeof input.vision !== "boolean") throw new UsageError("vision 需为布尔值");
+    return { input: input.vision ? ["text", "image"] : ["text"], output: ["text"] };
+  }
+  return null;
+}
+
+/** {env:VAR} 展开；环境变量缺失返回 null（区别于「未配置 key」） */
+function resolveApiKey(rawKey) {
+  if (!rawKey || typeof rawKey !== "string") return null;
+  const m = /^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(rawKey.trim());
+  if (m) return process.env[m[1]] || null;
+  return rawKey;
+}
+
+/**
+ * 1×1 PNG 最小多模态探针（仅 OpenAI 兼容端点）：
+ *   2xx → 支持 image；400/422 且错误指向图片/内容类型 → 不支持；其余 → 未知(null) 降级下一档。
+ * 结果缓存 10 分钟；key 只在服务端→上游，绝不进响应。
+ */
+async function probeVision({ baseURL, apiKey, modelId }) {
+  const cacheKey = `${baseURL}|${modelId}`;
+  const hit = probeCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < PROBE_CACHE_TTL_MS) return hit.result;
+
+  const url = /\/chat\/completions\/?$/.test(baseURL)
+    ? baseURL
+    : `${baseURL.replace(/\/+$/, "")}/chat/completions`;
+  const t0 = Date.now();
+  const result = { vision: null, httpStatus: null, latencyMs: 0, error: null };
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model: modelId,
+        max_tokens: 1,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "ping" },
+              {
+                type: "image_url",
+                image_url: {
+                  url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+                },
+              },
+            ],
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    result.httpStatus = res.status;
+    const bodyText = await res.text().catch(() => "");
+    if (res.ok) result.vision = true;
+    else if (
+      (res.status === 400 || res.status === 422) &&
+      /image|media|multimodal|content[-_ ]?type|invalid content/i.test(bodyText)
+    ) {
+      result.vision = false;
+    } else {
+      result.error = `HTTP ${res.status}${bodyText ? `: ${bodyText.slice(0, 160)}` : ""}`;
+    }
+  } catch (e) {
+    result.error = String(e?.message || e).slice(0, 200);
+  }
+  result.latencyMs = Date.now() - t0;
+  probeCache.set(cacheKey, { at: Date.now(), result });
+  return result;
+}
+
+/**
+ * 能力解析流水线。返回 { modalities, source, confirmed, probe }，modalities 恒为合法结构：
+ *   user      —— 本次请求显式指定（vision / modalities 入参）
+ *   existing  —— 配置中已有合法 modalities（配置即运行态真值，优先于目录/实测，不 churn 人工设定）
+ *   catalog   —— 内置目录元数据（**仅 api.url 非空的内置模型可信**：配置自声明模型的 capabilities
+ *                是配置回声，name-only 缺陷态下恒为全 false，采信会把识图缺失固化 → 让其落入后续档恢复）
+ *   probe     —— 1×1 PNG 实测（仅裁决 image；audio/video/pdf 等未测模态沿用 existing/目录证据，
+ *                实测不丢已有声明。OpenAI 兼容端点；配置了 key 但 {env} 缺失则跳过）
+ *   preset    —— 识图模型预设名单
+ *   default   —— 兜底纯文本（confirmed:false，note 提示可实测）
+ * forceProbe=true（能力再初始化的 probe 模式）：跳过 user/existing/catalog 前置档强制实测，
+ * 实测无定论时仍回退 existing → preset → default。
+ */
+async function resolveCapabilities({
+  requested = null,
+  catalogModel = null,
+  existingEntry = null,
+  npm = "",
+  baseURL = "",
+  apiKey = null,
+  modelId,
+  forceProbe = false,
+}) {
+  const wrap = (modalities, source, probe = null) => ({
+    modalities,
+    source,
+    confirmed: source !== "default",
+    probe,
+  });
+
+  if (requested && !forceProbe) return wrap(requested, "user");
+
+  const existing = validateModalities(existingEntry?.modalities) ? existingEntry.modalities : null;
+  const trustedCatalog = catalogModel?.api?.url
+    ? modalitiesFromCatalogCapabilities(catalogModel.capabilities)
+    : null;
+
+  if (!forceProbe) {
+    if (existing) return wrap(existing, "existing");
+    if (trustedCatalog) return wrap(trustedCatalog, "catalog");
+  }
+
+  let probeInfo = null;
+  if (npm === "@ai-sdk/openai-compatible" && /^https?:\/\//i.test(baseURL || "")) {
+    // 配置了 key 却解析不出（{env} 缺失）→ 跳过探测，避免注定 401 的请求
+    const resolvedKey = apiKey ? resolveApiKey(apiKey) : "";
+    if (!apiKey || resolvedKey) {
+      probeInfo = await probeVision({ baseURL, apiKey: resolvedKey || null, modelId });
+      if (probeInfo.vision !== null) {
+        // 实测只裁决 image；其余模态沿用证据基底（existing / 可信目录），避免丢 audio/video/pdf 声明
+        const base = existing || trustedCatalog || { input: ["text"], output: ["text"] };
+        const others = base.input.filter((x) => x !== "image");
+        const input = probeInfo.vision
+          ? [...new Set([...others, "image"])]
+          : others.length
+            ? others
+            : ["text"];
+        const merged = { input, output: base.output };
+        return wrap(validateModalities(merged) ? merged : base, "probe", probeInfo);
+      }
+    } else {
+      probeInfo = { vision: null, httpStatus: null, latencyMs: 0, error: "apiKey 引用的环境变量缺失，已跳过实测" };
+    }
+  }
+
+  // 实测无定论（或不可探测）→ 回退既有声明，再走名单/兜底
+  if (existing) return wrap(existing, "existing", probeInfo);
+  if (VISION_MODEL_RE.test(modelId)) return wrap({ input: ["text", "image"], output: ["text"] }, "preset", probeInfo);
+  return wrap({ input: ["text"], output: ["text"] }, "default", probeInfo);
+}
+
+// ---------------------------------------------------------------------------
 // 切换大模型
 // ---------------------------------------------------------------------------
 
@@ -581,19 +793,29 @@ export function currentModelInfo() {
   };
 }
 
-/** 自定义 provider 摘要（baseURL 公开，apiKey 只报有无） */
+/** 自定义 provider 摘要（baseURL 公开，apiKey 只报有无；models 带 modalities 供识图徽标/缺口提示） */
 export function summarizeProviders(effective) {
   const p = effective.provider;
   if (!isPlainObj(p)) return [];
-  return Object.entries(p).map(([id, v]) => ({
-    id,
-    name: v?.name || id,
-    npm: v?.npm || null,
-    baseURL: v?.options?.baseURL ?? null,
-    hasApiKey: Boolean(v?.options?.apiKey),
-    modelCount: isPlainObj(v?.models) ? Object.keys(v.models).length : 0,
-    onlyConfiguredModels: Boolean(v?.only_configured_models),
-  }));
+  return Object.entries(p).map(([id, v]) => {
+    const models = isPlainObj(v?.models) ? v.models : null;
+    return {
+      id,
+      name: v?.name || id,
+      npm: v?.npm || null,
+      baseURL: v?.options?.baseURL ?? null,
+      hasApiKey: Boolean(v?.options?.apiKey),
+      modelCount: models ? Object.keys(models).length : 0,
+      onlyConfiguredModels: Boolean(v?.only_configured_models),
+      models: models
+        ? Object.entries(models).map(([modelId, mv]) => ({
+            modelId,
+            name: (isPlainObj(mv) && mv.name) || modelId,
+            modalities: isPlainObj(mv) && validateModalities(mv.modalities) ? mv.modalities : null,
+          }))
+        : [],
+    };
+  });
 }
 
 /**
@@ -745,6 +967,7 @@ export async function addProvider(input = {}) {
   const apiKey = String(input.apiKey || "").trim();
   if (apiKey && /\s/.test(apiKey)) throw new UsageError("apiKey 不能含空白（可填 {env:MY_KEY} 引用环境变量）");
   const setAsCurrent = input.setAsCurrent === true;
+  const requested = parseRequestedModalities(input); //显式能力入参，非法 → UsageError(400)
 
   const { effective } = readMergedConfig();
   const mergedProvider = isPlainObj(effective.provider) ? effective.provider : null;
@@ -771,13 +994,36 @@ export async function addProvider(input = {}) {
   const block = { ...(existing || {}), name, npm };
   if (inCatalog) delete block.only_configured_models;
   else block.only_configured_models = true;
-  block.models = {
-    ...(isPlainObj(existing?.models) ? existing.models : {}),
-    ...Object.fromEntries(catalogModels.map((m) => [m.modelID, { name: m.name }])),
-    [modelId]: { name: modelName },
-  };
   block.options = { ...(isPlainObj(existing?.options) ? existing.options : {}), baseURL };
   if (apiKey) block.options.apiKey = apiKey;
+
+  // —— 能力初始化（修复：初次添加不识别识图）——
+  // 写配置前先跑完流水线，一次写入成型；新模型总是显式声明 modalities（含兜底纯文本），
+  // 目录保全模型仅在自身条目缺合法 modalities 时按目录补（fill-if-missing，不覆盖人工设定）。
+  const existingModels = isPlainObj(existing?.models) ? existing.models : {};
+  const catalogModel = catalogModels.find((m) => m.modelID === modelId) || null;
+  const caps = await resolveCapabilities({
+    requested,
+    catalogModel,
+    existingEntry: existingModels[modelId],
+    npm,
+    baseURL,
+    apiKey: apiKey || (isPlainObj(existing?.options) ? existing.options.apiKey : null),
+    modelId,
+  });
+  const fillCap = (m) => {
+    if (validateModalities(existingModels[m.modelID]?.modalities)) return {};
+    if (!m.api?.url) return {}; // 配置自声明模型的 capabilities 是回声，不足为凭（防 name-only 缺陷态固化）
+    const cap = modalitiesFromCatalogCapabilities(m.capabilities);
+    return cap ? { modalities: cap } : {};
+  };
+  block.models = {
+    ...existingModels,
+    ...Object.fromEntries(
+      catalogModels.map((m) => [m.modelID, { ...existingModels[m.modelID], name: m.name, ...fillCap(m) }]),
+    ),
+    [modelId]: { ...existingModels[modelId], name: modelName, modalities: caps.modalities },
+  };
 
   const preserved = catalogModels.filter((m) => m.modelID !== modelId).map((m) => m.key);
   const endpointConflicts = catalogModels
@@ -825,11 +1071,14 @@ export async function addProvider(input = {}) {
   const conflictWarn = endpointConflicts.length
     ? `；注意：目录原模型 ${endpointConflicts.map((c) => c.model).join("、")} 原端点 ${endpointConflicts[0].catalogUrl} 与新 baseURL 不同，将随该 provider 共用新端点`
     : "";
-  const baseNote = verified
+  const capNote = `；模型能力已初始化（来源：${CAP_SOURCE_CN[caps.source]}）${
+    caps.source === "default" ? "，识图能力未确认，可在模型详情调用能力再初始化实测" : ""
+  }`;
+  const baseNote = (verified
     ? inCatalog
       ? `已写入配置；内置目录原模型 ${preserved.join("、") || "无"} 已一并并入，未被顶掉${conflictWarn}。新会话生效`
       : "已写入配置；新会话生效，已运行的 MiMoCode TUI 需重新选择或重启"
-    : `已写入 provider，但 CLI 校验未通过${verifyError ? `：${verifyError}` : ""}，请检查 baseURL / 模型 ID 后刷新目录`;
+    : `已写入 provider，但 CLI 校验未通过${verifyError ? `：${verifyError}` : ""}，请检查 baseURL / 模型 ID 后刷新目录`) + capNote;
 
   return {
     providerId,
@@ -845,7 +1094,97 @@ export async function addProvider(input = {}) {
     verified,
     verifyError,
     recent,
+    capabilities: caps, // { modalities, source, confirmed, probe }
     note: baseNote,
+  };
+}
+
+/**
+ * 能力再初始化：对**已写入配置**的 provider/model 补写/移除 modalities（存量模型补救、手动重测）。
+ * mode：auto（流水线）| probe（强制实测，跳过 user/catalog）| clear（移除声明=能力级回滚）；
+ * 显式传 modalities/vision 等价 user 来源（仅 auto）。读写同一配置文件，不跨文件复制 provider 块。
+ * 返回 { providerId, modelId, mode, configFile, capabilities, note }；不合法入参抛 UsageError。
+ */
+export async function initModelCapabilities(input = {}) {
+  const providerId = String(input.providerId || "").trim();
+  if (!PROVIDER_ID_RE.test(providerId)) throw new UsageError("providerId 格式不正确");
+  const modelId = String(input.modelId || "").trim();
+  if (!modelId || /\s/.test(modelId)) throw new UsageError("modelId 不能为空且不能含空白字符");
+  const mode = String(input.mode || "auto");
+  if (!["auto", "probe", "clear"].includes(mode)) throw new UsageError("mode 仅支持 auto / probe / clear");
+  const requested = mode === "clear" ? null : parseRequestedModalities(input);
+
+  // 找到实际声明了该模型的配置文件（优先级高者先，与 removeProvider 的 modelSource 口径一致）
+  const files = configCandidates().filter((f) => f.exists);
+  let hit = null;
+  for (let i = files.length - 1; i >= 0; i--) {
+    let own;
+    try {
+      own = JSON.parse(stripJsonc(fs.readFileSync(files[i].path, "utf8")));
+    } catch {
+      continue;
+    }
+    const block = isPlainObj(own?.provider) ? own.provider[providerId] : null;
+    const entry = isPlainObj(block) && isPlainObj(block.models) ? block.models[modelId] : null;
+    if (isPlainObj(entry)) {
+      hit = { file: files[i], raw: fs.readFileSync(files[i].path, "utf8"), own, block, entry };
+      break;
+    }
+  }
+  if (!hit) {
+    throw new UsageError(`模型 ${providerId}/${modelId} 未在配置文件中声明，请先通过「新增大模型」添加`);
+  }
+
+  if (mode === "clear") {
+    const { modalities: _drop, ...restEntry } = hit.entry;
+    const nextProvider = {
+      ...hit.own.provider,
+      [providerId]: { ...hit.block, models: { ...hit.block.models, [modelId]: restEntry } },
+    };
+    fs.writeFileSync(hit.file.path, setTopLevelValue(hit.raw, "provider", JSON.stringify(nextProvider)));
+    invalidateModelCache();
+    return {
+      providerId,
+      modelId,
+      mode,
+      configFile: hit.file.path,
+      capabilities: { modalities: null, source: "clear", confirmed: false, probe: null },
+      note: "已移除该模型的 modalities 声明；对新会话生效",
+    };
+  }
+
+  const catalog = await listModels();
+  const catalogModels = (catalog.models || []).filter((m) => m.providerID === providerId);
+  const caps = await resolveCapabilities({
+    requested,
+    catalogModel: catalogModels.find((m) => m.modelID === modelId) || null,
+    existingEntry: hit.entry,
+    npm: hit.block.npm,
+    baseURL: isPlainObj(hit.block.options) ? hit.block.options.baseURL : null,
+    apiKey: isPlainObj(hit.block.options) ? hit.block.options.apiKey : null,
+    modelId,
+    forceProbe: mode === "probe",
+  });
+
+  const nextProvider = {
+    ...hit.own.provider,
+    [providerId]: {
+      ...hit.block,
+      models: { ...hit.block.models, [modelId]: { ...hit.entry, modalities: caps.modalities } },
+    },
+  };
+  fs.writeFileSync(hit.file.path, setTopLevelValue(hit.raw, "provider", JSON.stringify(nextProvider)));
+  invalidateModelCache();
+
+  return {
+    providerId,
+    modelId,
+    mode,
+    configFile: hit.file.path,
+    capabilities: caps,
+    note: `已写入模型能力（来源：${CAP_SOURCE_CN[caps.source]}）；对新会话生效${
+      caps.source === "default" ? "，识图能力未确认" : ""
+    }`,
   };
 }
 
