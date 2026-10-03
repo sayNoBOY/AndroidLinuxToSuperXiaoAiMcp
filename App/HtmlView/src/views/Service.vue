@@ -443,6 +443,8 @@ function blankAddForm() {
   return {
     providerId: '', name: '', npm: '@ai-sdk/openai-compatible',
     baseURL: '', modelId: '', modelName: '', apiKey: '', setAsCurrent: true,
+    // 6 项能力手动标定（默认=CLI 缺省：仅工具调用开）；提交时全量传 capabilities
+    caps: { reasoning: false, tool_call: true, attachment: false, image: false, audio: false, video: false },
   }
 }
 const adForm = ref(blankAddForm())
@@ -466,6 +468,10 @@ const adCanSubmit = computed(() =>
   !adSaving.value &&
   adForm.value.providerId && adForm.value.npm && adForm.value.baseURL && adForm.value.modelId,
 )
+/** xiaomi 系（mimo/xiaomi 同源家族）：未填 API Key 时后端可走 auth 登录连接（xiaomi 特殊处理） */
+const adIsFamily = computed(() => ['mimo', 'xiaomi'].includes(adForm.value.providerId.trim()))
+/** 本机已有 MiMo 登录凭据（GET /llm credentials：xiaomi + hasKey，来自 mimo auth login） */
+const adAuthReady = computed(() => llmCreds.value.some((c) => c.provider === 'xiaomi' && c.hasKey))
 
 // 任务列表提醒弹窗「去配置大模型」写入的跳转标记（与 HomeView.vue 约定，用一次即清）
 const OPEN_ADD_LLM_KEY = 'suishen.openAddLlm'
@@ -497,6 +503,7 @@ function applyPreset(p) {
     providerId: p.providerId, name: p.label, npm: p.npm,
     baseURL: p.baseURL, modelId: p.modelId, modelName: p.modelName,
     apiKey: adForm.value.apiKey, setAsCurrent: adForm.value.setAsCurrent,
+    caps: adForm.value.caps ?? blankAddForm().caps,
   }
   adError.value = ''
 }
@@ -516,13 +523,25 @@ async function submitAdd() {
       modelName: f.modelName.trim() || f.modelId.trim(),
       apiKey: f.apiKey.trim() || undefined,
       setAsCurrent: f.setAsCurrent === true,
+      capabilities: { ...(f.caps || blankAddForm().caps) }, // 6 项手动标定，全量必传
     })
     adOpen.value = false
     if (r.verified) {
       const warn = r.endpointConflicts?.length
         ? `（${(r.preservedCatalogModels || []).join('、')} 已并入，端点改用新 baseURL）`
         : ''
-      toast(`已新增 ${r.providerId}${r.model ? ` · 当前模型 ${r.model}` : ''} ✓${warn}`)
+      // xiaomi 特殊处理：auth 登录连接 / Provider ID 归一（mimo→xiaomi）时在 toast 里点明
+      const idText = r.requestedProviderId && r.requestedProviderId !== r.providerId
+        ? `${r.requestedProviderId}→${r.providerId}`
+        : r.providerId
+      const authTag = r.viaAuth?.used ? '，已走 auth 登录连接' : ''
+      // 能力回显：6 项手动标定结果附在成功提示里（勾选项列出，全不勾提示纯文本）
+      const caps = r.capabilities || {}
+      const capTags = ['reasoning', 'tool_call', 'attachment', 'image', 'audio', 'video']
+        .filter((k) => caps[k])
+        .map((k) => ({ reasoning: '推理', tool_call: '工具调用', attachment: '附件', image: '图像', audio: '音频', video: '视频' })[k])
+      const capTag = capTags.length ? ` · 能力：${capTags.join('/')}` : ' · 能力：仅文本'
+      toast(`已新增 ${idText}${r.model ? ` · 当前模型 ${r.model}` : ''} ✓${authTag}${capTag}${warn}`)
     } else toast(r.note)
     await loadLlm({ refresh: true, quiet: false })
   } catch (e) {
@@ -1088,13 +1107,33 @@ onUnmounted(() => {
               <input
                 v-model="adForm.apiKey" class="input"
                 :type="adShowKey ? 'text' : 'password'"
-                :disabled="adSaving" placeholder="sk-… 或 {env:MY_KEY}；本地端点可留空"
+                :disabled="adSaving"
+                :placeholder="adIsFamily
+                  ? '留空走登录凭据（auth）；或填 sk-… / {env:MY_KEY}'
+                  : 'sk-… 或 {env:MY_KEY}；本地端点可留空'"
               />
               <button class="ad-eye" type="button" @click="adShowKey = !adShowKey">
                 {{ adShowKey ? '隐藏' : '显示' }}
               </button>
             </div>
+            <em v-if="adIsFamily" class="ad-hint">{{
+              adAuthReady
+                ? '已检测到 MiMo 登录凭据：API Key 可留空，提交后自动走 auth 登录连接（挂 xiaomi、端点切登录网关，不写明文 key）。'
+                : 'API Key 可留空，但需先在 MiMoCode 执行 mimo auth login 完成登录；否则请填写 API Key。'
+            }}</em>
           </label>
+          <div class="ad-cap">
+            <span class="ad-cap-title">能力标定（按模型实际能力勾选，写入 mimocode 配置）</span>
+            <div class="ad-cap-grid">
+              <label class="ad-check"><input v-model="adForm.caps.reasoning" type="checkbox" :disabled="adSaving" /><span>推理</span></label>
+              <label class="ad-check"><input v-model="adForm.caps.tool_call" type="checkbox" :disabled="adSaving" /><span>工具调用</span></label>
+              <label class="ad-check"><input v-model="adForm.caps.attachment" type="checkbox" :disabled="adSaving" /><span>附件</span></label>
+              <label class="ad-check"><input v-model="adForm.caps.image" type="checkbox" :disabled="adSaving" /><span>图像输入</span></label>
+              <label class="ad-check"><input v-model="adForm.caps.audio" type="checkbox" :disabled="adSaving" /><span>音频输入</span></label>
+              <label class="ad-check"><input v-model="adForm.caps.video" type="checkbox" :disabled="adSaving" /><span>视频输入</span></label>
+            </div>
+            <em class="ad-hint">6 项均必选（勾/不勾都写入配置）：不勾的能力会在 mimocode 中显式声明为不支持，MiMoCode 将按此拦截相应输入。</em>
+          </div>
           <label class="ad-check">
             <input v-model="adForm.setAsCurrent" type="checkbox" :disabled="adSaving" />
             <span>添加后设为当前模型（写入顶层 model 并置入 recent）</span>
@@ -1111,7 +1150,8 @@ onUnmounted(() => {
         </div>
         <div class="sw-note">
           预设 baseURL 为厂商公开端点、模型 ID 为可编辑示例（以厂商文档为准）；密钥明文写入 mimocode 配置，
-          也可用 <b>{env:VAR}</b> 引用环境变量。写回后新会话生效。
+          也可用 <b>{env:VAR}</b> 引用环境变量。写回后新会话生效。xiaomi/mimo 系留空密钥可走
+          <b>auth 登录连接</b>（自动挂 xiaomi、端点切登录网关）。
         </div>
       </div>
     </div>
@@ -1569,6 +1609,12 @@ onUnmounted(() => {
 }
 .ad-check input { width: 15px; height: 15px; margin-top: 1px; accent-color: var(--purple); flex-shrink: 0 }
 .ad-check span { flex: 1 }
+
+/* ===== 能力标定（6 项手动勾选） ===== */
+.ad-cap { display: flex; flex-direction: column; gap: 7px }
+.ad-cap-title { font-size: 11px; color: var(--t3) }
+.ad-cap-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px 10px }
+.ad-cap-grid .ad-check { font-size: 11.5px }
 
 /* ===== 修改密码弹层（当前密码 + 新密码二次确认） ===== */
 .pwd-form { display: flex; flex-direction: column; gap: 10px; padding-top: 14px; flex-shrink: 0 }

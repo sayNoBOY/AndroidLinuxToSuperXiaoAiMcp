@@ -11,8 +11,17 @@
  * 切换：把顶层 `model` 定点写进**优先级最高且已存在**的配置文件（JSONC 注释原样保留），
  *       并按官方约定把目标模型插到 state/model.json 的 recent 首位（去重、上限 10）。
  *
- * 能力：添加模型/能力再初始化时按 user > existing > catalog(仅内置) > probe > preset > default
- *       流水线解析并写入 modalities（识图等）——修复「初次添加大模型不识别识图能力」。
+ * 能力：新增大模型时由用户**手动标定** 6 项能力（推理/工具调用/附件/图像/音频/视频输入），
+ *       显式写入 provider.<id>.models.<id>（reasoning / tool_call / attachment / modalities）。
+ *       任务 95：已移除自动标定流水线（catalog/probe/preset/default 档、图像+音频探针、
+ *       识图预设名单、能力再初始化接口）——能力真值以用户勾选为准，配置即运行态真值。
+ *
+ * xiaomi 系特殊处理（任务 93，实测依据 taskRes/93/evidence/runtime_auth_matrix_result.txt）：
+ *   ① 能力：mimo/xiaomi 同源网关家族，目录按 modelID 跨 provider 查（mimo-v2.5 实挂 xiaomi 目录），
+ *      避免「单加 mimo 模型被标纯文本」；② 连接：家族内未填 apiKey 且已有 `mimo auth login`
+ *      登录凭据时走 auth 方式连接——providerID 归一为 xiaomi（运行时按 providerID 精确取
+ *      auth.json 凭据）、options.baseURL 改写为登录网关 metadata.base_url（预设端点不认登录凭据）、
+ *      不写明文 apiKey；probe 实测同用登录凭据打登录网关（凭据绝不发往第三方端点）。
  *
  * 安全：模型/凭据 DTO 全部走白名单字段，CLI 的 options/headers 与 auth.json 的 key 不落响应。
  */
@@ -532,24 +541,13 @@ export async function verifyModelRegistered(providerID, modelID) {
 }
 
 // ---------------------------------------------------------------------------
-// 模型能力初始化（modalities）——修复：初次添加大模型未识别识图能力
-//   流水线：user > catalog > probe > existing > preset > default
+// 模型能力手动标定（任务 95）：新增大模型时由用户勾选 6 项能力，显式写入配置。
+//   reasoning / tool_call / attachment → 模型条目同名布尔键
+//   image / audio / video             → modalities.input（text 恒有，output 恒 text）
+//   自动标定流水线（catalog/probe/preset/default）与能力再初始化接口已移除。
 // ---------------------------------------------------------------------------
 
 const MODALITY_ENUM = ["text", "audio", "image", "video", "pdf"];
-const PROBE_TIMEOUT_MS = 8000;
-const PROBE_CACHE_TTL_MS = 10 * 60 * 1000;
-const probeCache = new Map();
-
-/** 来源 → 中文（note 展示） */
-const CAP_SOURCE_CN = {
-  user: "用户指定",
-  catalog: "模型目录",
-  probe: "实测",
-  existing: "沿用已有配置",
-  preset: "预设名单",
-  default: "默认纯文本",
-};
 
 /**
  * modalities 写前校验（$schema 实测约束）：对象、input/output 均为非空数组、
@@ -566,178 +564,86 @@ export function validateModalities(m) {
   return true;
 }
 
-/** capabilities 里的 {text:true,image:false,…} 映射 → 数组；无 true 项返回 null */
-function modalityList(map) {
-  if (!isPlainObj(map)) return null;
-  const list = MODALITY_ENUM.filter((k) => map[k] === true);
-  return list.length ? list : null;
-}
-
-/** `mimo models --verbose` 的 capabilities → modalities；形状不符返回 null（不猜） */
-export function modalitiesFromCatalogCapabilities(caps) {
-  if (!isPlainObj(caps)) return null;
-  const m = { input: modalityList(caps.input), output: modalityList(caps.output) };
-  if (!m.input || !m.output) return null;
-  return validateModalities(m) ? m : null;
-}
-
-/** 识图预设正向名单——宁缺勿滥：只收确定支持图片输入的模型 */
-const VISION_MODEL_RE =
-  /^(gpt-4o|gpt-4\.1|gpt-5|claude-[a-z0-9.-]*?(?:sonnet|opus|haiku)|gemini-|qwen-vl|qwen\d+-vl|glm-4v|mimo-v2\.6|grok-2-vision|.*-vision)/i;
-
-/** 请求体显式能力入参：modalities 全量 或 vision 布尔简写；非法入参抛 UsageError(400) */
-function parseRequestedModalities(input) {
-  if (input.modalities !== undefined && input.modalities !== null) {
-    if (!validateModalities(input.modalities)) {
-      throw new UsageError("modalities 需为对象，input/output 均为非空数组，取值限 text/audio/image/video/pdf");
-    }
-    return input.modalities;
+/** 6 项能力手动标定入参：全部必填布尔，任一缺失/非布尔/未知键 → UsageError(400) */
+export function parseRequestedCapabilities(input) {
+  const caps = input.capabilities;
+  if (!isPlainObj(caps)) {
+    throw new UsageError("capabilities 需为对象，必须包含 6 项布尔标定：reasoning/tool_call/attachment/image/audio/video");
   }
-  if (input.vision !== undefined && input.vision !== null) {
-    if (typeof input.vision !== "boolean") throw new UsageError("vision 需为布尔值");
-    return { input: input.vision ? ["text", "image"] : ["text"], output: ["text"] };
+  const KEYS = ["reasoning", "tool_call", "attachment", "image", "audio", "video"];
+  const unknown = Object.keys(caps).filter((k) => !KEYS.includes(k));
+  if (unknown.length) throw new UsageError(`capabilities 含未知字段：${unknown.join("、")}`);
+  for (const k of KEYS) {
+    if (typeof caps[k] !== "boolean") throw new UsageError(`capabilities.${k} 需为布尔值`);
   }
-  return null;
-}
-
-/** {env:VAR} 展开；环境变量缺失返回 null（区别于「未配置 key」） */
-function resolveApiKey(rawKey) {
-  if (!rawKey || typeof rawKey !== "string") return null;
-  const m = /^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(rawKey.trim());
-  if (m) return process.env[m[1]] || null;
-  return rawKey;
+  return Object.fromEntries(KEYS.map((k) => [k, caps[k]]));
 }
 
 /**
- * 1×1 PNG 最小多模态探针（仅 OpenAI 兼容端点）：
- *   2xx → 支持 image；400/422 且错误指向图片/内容类型 → 不支持；其余 → 未知(null) 降级下一档。
- * 结果缓存 10 分钟；key 只在服务端→上游，绝不进响应。
+ * 6 项标定 → 模型条目写入字段：
+ *   reasoning/tool_call/attachment 平铺；image/audio/video 合成 modalities（text 恒有）。
+ * 结构在构造时即合法（text 兜底 + 枚举白名单），仍过 validateModalities 自检。
  */
-async function probeVision({ baseURL, apiKey, modelId }) {
-  const cacheKey = `${baseURL}|${modelId}`;
-  const hit = probeCache.get(cacheKey);
-  if (hit && Date.now() - hit.at < PROBE_CACHE_TTL_MS) return hit.result;
-
-  const url = /\/chat\/completions\/?$/.test(baseURL)
-    ? baseURL
-    : `${baseURL.replace(/\/+$/, "")}/chat/completions`;
-  const t0 = Date.now();
-  const result = { vision: null, httpStatus: null, latencyMs: 0, error: null };
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
-      },
-      body: JSON.stringify({
-        model: modelId,
-        max_tokens: 1,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: "ping" },
-              {
-                type: "image_url",
-                image_url: {
-                  url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
-                },
-              },
-            ],
-          },
-        ],
-      }),
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-    });
-    result.httpStatus = res.status;
-    const bodyText = await res.text().catch(() => "");
-    if (res.ok) result.vision = true;
-    else if (
-      (res.status === 400 || res.status === 422) &&
-      /image|media|multimodal|content[-_ ]?type|invalid content/i.test(bodyText)
-    ) {
-      result.vision = false;
-    } else {
-      result.error = `HTTP ${res.status}${bodyText ? `: ${bodyText.slice(0, 160)}` : ""}`;
-    }
-  } catch (e) {
-    result.error = String(e?.message || e).slice(0, 200);
+export function capabilityEntryFields(caps) {
+  const input = ["text"];
+  if (caps.image) input.push("image");
+  if (caps.audio) input.push("audio");
+  if (caps.video) input.push("video");
+  const modalities = { input, output: ["text"] };
+  if (!validateModalities(modalities)) {
+    throw new UsageError("modalities 构造异常（内部错误），已中止写入");
   }
-  result.latencyMs = Date.now() - t0;
-  probeCache.set(cacheKey, { at: Date.now(), result });
-  return result;
-}
-
-/**
- * 能力解析流水线。返回 { modalities, source, confirmed, probe }，modalities 恒为合法结构：
- *   user      —— 本次请求显式指定（vision / modalities 入参）
- *   existing  —— 配置中已有合法 modalities（配置即运行态真值，优先于目录/实测，不 churn 人工设定）
- *   catalog   —— 内置目录元数据（**仅 api.url 非空的内置模型可信**：配置自声明模型的 capabilities
- *                是配置回声，name-only 缺陷态下恒为全 false，采信会把识图缺失固化 → 让其落入后续档恢复）
- *   probe     —— 1×1 PNG 实测（仅裁决 image；audio/video/pdf 等未测模态沿用 existing/目录证据，
- *                实测不丢已有声明。OpenAI 兼容端点；配置了 key 但 {env} 缺失则跳过）
- *   preset    —— 识图模型预设名单
- *   default   —— 兜底纯文本（confirmed:false，note 提示可实测）
- * forceProbe=true（能力再初始化的 probe 模式）：跳过 user/existing/catalog 前置档强制实测，
- * 实测无定论时仍回退 existing → preset → default。
- */
-async function resolveCapabilities({
-  requested = null,
-  catalogModel = null,
-  existingEntry = null,
-  npm = "",
-  baseURL = "",
-  apiKey = null,
-  modelId,
-  forceProbe = false,
-}) {
-  const wrap = (modalities, source, probe = null) => ({
+  return {
+    reasoning: caps.reasoning,
+    tool_call: caps.tool_call,
+    attachment: caps.attachment,
     modalities,
-    source,
-    confirmed: source !== "default",
-    probe,
-  });
+  };
+}
 
-  if (requested && !forceProbe) return wrap(requested, "user");
+// ---------------------------------------------------------------------------
+// xiaomi 系家族（mimo/xiaomi 同源网关）：auth 登录凭据与跨 provider 目录查找
+//   实测依据（taskRes/93/evidence）：运行时凭据按 providerID 精确匹配（无 mimo→xiaomi 别名）；
+//   配置块 options.baseURL 压过 auth loader 的 metadata.base_url；登录 key 只认登录网关。
+// ---------------------------------------------------------------------------
 
-  const existing = validateModalities(existingEntry?.modalities) ? existingEntry.modalities : null;
-  const trustedCatalog = catalogModel?.api?.url
-    ? modalitiesFromCatalogCapabilities(catalogModel.capabilities)
-    : null;
+/** MiMo 自家家族 provider（同源网关；登录凭据挂在 xiaomi 条目下） */
+const XIAOMI_FAMILY_PROVIDERS = new Set(["mimo", "xiaomi"]);
 
-  if (!forceProbe) {
-    if (existing) return wrap(existing, "existing");
-    if (trustedCatalog) return wrap(trustedCatalog, "catalog");
+export function isXiaomiFamilyProvider(providerId) {
+  return XIAOMI_FAMILY_PROVIDERS.has(String(providerId || "").trim());
+}
+
+/** URL 等值比较用归一化（去首尾空白与尾部斜杠） */
+function normUrl(u) {
+  return String(u || "").trim().replace(/\/+$/, "");
+}
+
+/**
+ * 读取 auth.json 中 xiaomi 系登录凭据（`mimo auth login` / `/connect` 登录写入）。
+ * 仅家族内生效；按 providerID 精确匹配 + mimo↔xiaomi 别名回退（别名只用于「检测登录凭据
+ * 以启用 auth 连接」——运行时本身无别名，连接目标 providerID 以返回的 authProviderId 为准）。
+ * 返回 { key, baseURL, authProviderId }：key 仅限服务端 probe 使用，绝不进响应/日志。
+ * baseURL = metadata.base_url（登录网关；预设端点 api.xiaomimimo.com 不认该凭据，实测 401）。
+ */
+export function readAuthCredential(providerId) {
+  if (!isXiaomiFamilyProvider(providerId)) return null;
+  const p = authJsonPath();
+  if (!fs.existsSync(p)) return null;
+  try {
+    const obj = JSON.parse(fs.readFileSync(p, "utf8"));
+    if (!isPlainObj(obj)) return null;
+    const id = String(providerId).trim();
+    const alias = id === "mimo" ? "xiaomi" : "mimo";
+    const hit = (isPlainObj(obj[id]) && obj[id]) || (isPlainObj(obj[alias]) && obj[alias]) || null;
+    if (!hit || typeof hit.key !== "string" || !hit.key) return null;
+    const md = isPlainObj(hit.metadata) ? hit.metadata : null;
+    const baseURL =
+      md && typeof md.base_url === "string" && /^https?:\/\//i.test(md.base_url) ? md.base_url : null;
+    return { key: hit.key, baseURL, authProviderId: isPlainObj(obj[id]) ? id : alias };
+  } catch {
+    return null;
   }
-
-  let probeInfo = null;
-  if (npm === "@ai-sdk/openai-compatible" && /^https?:\/\//i.test(baseURL || "")) {
-    // 配置了 key 却解析不出（{env} 缺失）→ 跳过探测，避免注定 401 的请求
-    const resolvedKey = apiKey ? resolveApiKey(apiKey) : "";
-    if (!apiKey || resolvedKey) {
-      probeInfo = await probeVision({ baseURL, apiKey: resolvedKey || null, modelId });
-      if (probeInfo.vision !== null) {
-        // 实测只裁决 image；其余模态沿用证据基底（existing / 可信目录），避免丢 audio/video/pdf 声明
-        const base = existing || trustedCatalog || { input: ["text"], output: ["text"] };
-        const others = base.input.filter((x) => x !== "image");
-        const input = probeInfo.vision
-          ? [...new Set([...others, "image"])]
-          : others.length
-            ? others
-            : ["text"];
-        const merged = { input, output: base.output };
-        return wrap(validateModalities(merged) ? merged : base, "probe", probeInfo);
-      }
-    } else {
-      probeInfo = { vision: null, httpStatus: null, latencyMs: 0, error: "apiKey 引用的环境变量缺失，已跳过实测" };
-    }
-  }
-
-  // 实测无定论（或不可探测）→ 回退既有声明，再走名单/兜底
-  if (existing) return wrap(existing, "existing", probeInfo);
-  if (VISION_MODEL_RE.test(modelId)) return wrap({ input: ["text", "image"], output: ["text"] }, "preset", probeInfo);
-  return wrap({ input: ["text"], output: ["text"] }, "default", probeInfo);
 }
 
 // ---------------------------------------------------------------------------
@@ -963,24 +869,49 @@ export async function addProvider(input = {}) {
   const modelId = String(input.modelId || "").trim();
   if (!modelId || /\s/.test(modelId)) throw new UsageError("modelId 不能为空且不能含空白字符");
   const modelName = String(input.modelName || "").trim() || modelId;
-  const name = String(input.name || "").trim() || providerId;
+  let name = String(input.name || "").trim() || providerId;
   const apiKey = String(input.apiKey || "").trim();
   if (apiKey && /\s/.test(apiKey)) throw new UsageError("apiKey 不能含空白（可填 {env:MY_KEY} 引用环境变量）");
   const setAsCurrent = input.setAsCurrent === true;
-  const requested = parseRequestedModalities(input); //显式能力入参，非法 → UsageError(400)
+  const caps = parseRequestedCapabilities(input); // 6 项手动标定，缺失/非法 → UsageError(400)
 
   const { effective } = readMergedConfig();
   const mergedProvider = isPlainObj(effective.provider) ? effective.provider : null;
-  const conflict = mergedProvider?.[providerId];
-  if (conflict && (conflict?.options?.baseURL !== baseURL || conflict?.npm !== npm)) {
+
+  // —— xiaomi 系特殊处理：auth 方式登录连接（实测依据 taskRes/93/evidence/runtime_auth_matrix_result.txt）——
+  // 运行时凭据按 providerID 精确取 auth.json（无 mimo→xiaomi 别名）；配置块 options.baseURL 压过
+  // auth loader；登录 key 只认登录网关。故家族内未填 apiKey、已有登录凭据（含网关）、端点仍是
+  // 预设值、家族内无已配 key 时：providerID 归一为凭据条目（mimo→xiaomi）、端点改写登录网关、
+  // 不写 apiKey —— 连接即走 auth 登录凭据（「通过 auth 方式登录链接」）。
+  const family = isXiaomiFamilyProvider(providerId);
+  const authCred = family ? readAuthCredential(providerId) : null;
+  const presetBaseURL = PROVIDER_PRESETS.find((p) => p.id === "mimo")?.baseURL || "";
+  const sameAsPreset = Boolean(presetBaseURL) && normUrl(baseURL) === normUrl(presetBaseURL);
+  const wantAuth = Boolean(family && !apiKey && authCred?.baseURL && sameAsPreset);
+  // 目标块判定：auth 模式下先定候选 ID（mimo→xiaomi），只查**该块**是否已配手工 key——
+  // 家族另一 ID 的 key 不影响本块走 auth（家族级门控会误挡「mimo 已配 key、再加 xiaomi 走 auth」）。
+  const candidateId =
+    wantAuth && authCred.authProviderId !== providerId ? authCred.authProviderId : providerId;
+  const hasExistingKey = Boolean(mergedProvider?.[candidateId]?.options?.apiKey);
+  const viaAuth = wantAuth && !hasExistingKey;
+  const effectiveProviderId = viaAuth ? candidateId : providerId;
+  const effectiveBaseURL = viaAuth ? authCred.baseURL : baseURL;
+  if (viaAuth && name === providerId) name = effectiveProviderId; // 显式未传 name 时归一，避免 xiaomi 块显示 mimo
+
+  const conflict = mergedProvider?.[effectiveProviderId];
+  const conflictUrls = new Set([normUrl(baseURL), normUrl(effectiveBaseURL)]);
+  if (
+    conflict &&
+    (conflict?.npm !== npm || !conflictUrls.has(normUrl(conflict?.options?.baseURL)))
+  ) {
     throw new UsageError(
-      `providerId「${providerId}」已存在且配置不同（baseURL/适配器不一致），请改用其他 ID，如 ${providerId}-2`,
+      `providerId「${effectiveProviderId}」已存在且配置不同（baseURL/适配器不一致），请改用其他 ID，如 ${effectiveProviderId}-2`,
     );
   }
 
   const { target, raw, own } = readTargetConfig();
   const ownProvider = isPlainObj(own.provider) ? own.provider : {};
-  const existing = isPlainObj(ownProvider[providerId]) ? ownProvider[providerId] : null;
+  const existing = isPlainObj(ownProvider[effectiveProviderId]) ? ownProvider[effectiveProviderId] : null;
 
   // providerId 命中**内置目录**时：
   //  ① 不写 only_configured_models（该键只要出现就会收窄目录模型，官方示例只用于全新端点）；
@@ -988,57 +919,45 @@ export async function addProvider(input = {}) {
   //     所以把目录里该 provider 的既有模型**一并写进 models** 保全（xiaomi 系同理，写入无副作用）；
   //  ③ 目录模型自带 endpoint 且不受 options.baseURL 影响，但保全后的模型会共用新 baseURL → 给出提示。
   const catalog = await listModels();
-  const catalogModels = (catalog.models || []).filter((m) => m.providerID === providerId);
+  const catalogModels = (catalog.models || []).filter((m) => m.providerID === effectiveProviderId);
   const inCatalog = catalogModels.length > 0;
 
   const block = { ...(existing || {}), name, npm };
   if (inCatalog) delete block.only_configured_models;
   else block.only_configured_models = true;
-  block.options = { ...(isPlainObj(existing?.options) ? existing.options : {}), baseURL };
+  block.options = { ...(isPlainObj(existing?.options) ? existing.options : {}), baseURL: effectiveBaseURL };
   if (apiKey) block.options.apiKey = apiKey;
 
-  // —— 能力初始化（修复：初次添加不识别识图）——
-  // 写配置前先跑完流水线，一次写入成型；新模型总是显式声明 modalities（含兜底纯文本），
-  // 目录保全模型仅在自身条目缺合法 modalities 时按目录补（fill-if-missing，不覆盖人工设定）。
+  // —— 能力手动标定（任务 95）：用户勾选的 6 项直接落盘，无自动探测/目录推断。
+  // 保全的目录模型仅 name-only 合并（不覆盖已有条目字段、不代写能力——能力以用户标定为准）。
   const existingModels = isPlainObj(existing?.models) ? existing.models : {};
-  const catalogModel = catalogModels.find((m) => m.modelID === modelId) || null;
-  const caps = await resolveCapabilities({
-    requested,
-    catalogModel,
-    existingEntry: existingModels[modelId],
-    npm,
-    baseURL,
-    apiKey: apiKey || (isPlainObj(existing?.options) ? existing.options.apiKey : null),
-    modelId,
-  });
-  const fillCap = (m) => {
-    if (validateModalities(existingModels[m.modelID]?.modalities)) return {};
-    if (!m.api?.url) return {}; // 配置自声明模型的 capabilities 是回声，不足为凭（防 name-only 缺陷态固化）
-    const cap = modalitiesFromCatalogCapabilities(m.capabilities);
-    return cap ? { modalities: cap } : {};
-  };
+  const entryFields = capabilityEntryFields(caps);
   block.models = {
     ...existingModels,
     ...Object.fromEntries(
-      catalogModels.map((m) => [m.modelID, { ...existingModels[m.modelID], name: m.name, ...fillCap(m) }]),
+      catalogModels.map((m) => [m.modelID, { ...existingModels[m.modelID], name: m.name }]),
     ),
-    [modelId]: { ...existingModels[modelId], name: modelName, modalities: caps.modalities },
+    [modelId]: { ...existingModels[modelId], name: modelName, ...entryFields },
   };
 
   const preserved = catalogModels.filter((m) => m.modelID !== modelId).map((m) => m.key);
   const endpointConflicts = catalogModels
-    .filter((m) => m.api?.url && m.api.url !== baseURL)
+    .filter((m) => m.api?.url && m.api.url !== effectiveBaseURL)
     .map((m) => ({ model: m.key, catalogUrl: m.api.url }));
 
-  let next = setTopLevelValue(raw, "provider", JSON.stringify({ ...ownProvider, [providerId]: block }));
+  let next = setTopLevelValue(raw, "provider", JSON.stringify({ ...ownProvider, [effectiveProviderId]: block }));
 
   // 允许名单/拒绝名单与新 provider 保持一致（数组整键替换 → 以合并后取值为基础，不丢其它条目）
-  if (Array.isArray(effective.enabled_providers) && !effective.enabled_providers.includes(providerId)) {
-    const merged = [...new Set([...(own.enabled_providers ?? effective.enabled_providers), providerId])];
+  if (Array.isArray(effective.enabled_providers) && !effective.enabled_providers.includes(effectiveProviderId)) {
+    const merged = [
+      ...new Set([...(own.enabled_providers ?? effective.enabled_providers), effectiveProviderId]),
+    ];
     next = setTopLevelValue(next, "enabled_providers", JSON.stringify(merged));
   }
-  if (Array.isArray(effective.disabled_providers) && effective.disabled_providers.includes(providerId)) {
-    const kept = (own.disabled_providers ?? effective.disabled_providers).filter((x) => x !== providerId);
+  if (Array.isArray(effective.disabled_providers) && effective.disabled_providers.includes(effectiveProviderId)) {
+    const kept = (own.disabled_providers ?? effective.disabled_providers).filter(
+      (x) => x !== effectiveProviderId,
+    );
     next = kept.length
       ? setTopLevelValue(next, "disabled_providers", JSON.stringify(kept))
       : removeTopLevelKey(next, "disabled_providers");
@@ -1051,7 +970,7 @@ export async function addProvider(input = {}) {
   let verified = false;
   let verifyError = null;
   try {
-    verified = await verifyModelRegistered(providerId, modelId);
+    verified = await verifyModelRegistered(effectiveProviderId, modelId);
   } catch (e) {
     verifyError = e.message;
   }
@@ -1060,9 +979,9 @@ export async function addProvider(input = {}) {
   let recent = readModelState().recent;
   if (applied) {
     const target2 = readTargetConfig();
-    writeTarget(target2.target, setTopLevelModel(target2.raw, `${providerId}/${modelId}`));
+    writeTarget(target2.target, setTopLevelModel(target2.raw, `${effectiveProviderId}/${modelId}`));
     try {
-      recent = pushRecentModel(providerId, modelId);
+      recent = pushRecentModel(effectiveProviderId, modelId);
     } catch (e) {
       console.warn("[MiMoCodeConfig] 更新 model.json recent 失败:", e.message);
     }
@@ -1071,18 +990,47 @@ export async function addProvider(input = {}) {
   const conflictWarn = endpointConflicts.length
     ? `；注意：目录原模型 ${endpointConflicts.map((c) => c.model).join("、")} 原端点 ${endpointConflicts[0].catalogUrl} 与新 baseURL 不同，将随该 provider 共用新端点`
     : "";
-  const capNote = `；模型能力已初始化（来源：${CAP_SOURCE_CN[caps.source]}）${
-    caps.source === "default" ? "，识图能力未确认，可在模型详情调用能力再初始化实测" : ""
-  }`;
+  const checkedTags = [
+    caps.reasoning && "推理",
+    caps.tool_call && "工具调用",
+    caps.attachment && "附件",
+    caps.image && "图像输入",
+    caps.audio && "音频输入",
+    caps.video && "视频输入",
+  ].filter(Boolean);
+  const capNote = `；能力已手动标定（${checkedTags.join("·") || "无勾选，仅文本"}）`;
+  const blockHasKey = Boolean(block.options?.apiKey);
+  const authNote = viaAuth
+    ? `；未填 API Key，已按 MiMo 登录凭据走 auth 连接（端点切换为登录网关 ${effectiveBaseURL}${
+        effectiveProviderId !== providerId
+          ? `，Provider ID 归一为 ${effectiveProviderId}——运行时按 providerID 读取 auth.json 凭据`
+          : ""
+      }）`
+    : family && !blockHasKey && sameAsPreset
+      ? `；注意：未填 API Key 且未走 auth 连接（${
+          authCred?.baseURL
+            ? "目标 provider 已有手工 API Key 配置，auth 连接未启用"
+            : "未检测到 MiMo 登录凭据（或凭据缺登录网关），可先执行 mimo auth login 或填写 API Key"
+        }），连接可能失败`
+      : "";
   const baseNote = (verified
     ? inCatalog
       ? `已写入配置；内置目录原模型 ${preserved.join("、") || "无"} 已一并并入，未被顶掉${conflictWarn}。新会话生效`
       : "已写入配置；新会话生效，已运行的 MiMoCode TUI 需重新选择或重启"
-    : `已写入 provider，但 CLI 校验未通过${verifyError ? `：${verifyError}` : ""}，请检查 baseURL / 模型 ID 后刷新目录`) + capNote;
+    : `已写入 provider，但 CLI 校验未通过${verifyError ? `：${verifyError}` : ""}，请检查 baseURL / 模型 ID 后刷新目录`) + capNote + authNote;
 
   return {
-    providerId,
-    model: applied ? `${providerId}/${modelId}` : null,
+    providerId: effectiveProviderId,
+    ...(effectiveProviderId !== providerId ? { requestedProviderId: providerId } : {}),
+    viaAuth: viaAuth
+      ? {
+          used: true,
+          providerId: effectiveProviderId,
+          baseURL: effectiveBaseURL,
+          normalizedFrom: effectiveProviderId !== providerId ? providerId : null,
+        }
+      : { used: false },
+    model: applied ? `${effectiveProviderId}/${modelId}` : null,
     modelId,
     configFile: target.path,
     configScope: target.scope,
@@ -1094,99 +1042,11 @@ export async function addProvider(input = {}) {
     verified,
     verifyError,
     recent,
-    capabilities: caps, // { modalities, source, confirmed, probe }
+    capabilities: { ...caps, modalities: entryFields.modalities }, // 6 项手动标定回显
     note: baseNote,
   };
 }
 
-/**
- * 能力再初始化：对**已写入配置**的 provider/model 补写/移除 modalities（存量模型补救、手动重测）。
- * mode：auto（流水线）| probe（强制实测，跳过 user/catalog）| clear（移除声明=能力级回滚）；
- * 显式传 modalities/vision 等价 user 来源（仅 auto）。读写同一配置文件，不跨文件复制 provider 块。
- * 返回 { providerId, modelId, mode, configFile, capabilities, note }；不合法入参抛 UsageError。
- */
-export async function initModelCapabilities(input = {}) {
-  const providerId = String(input.providerId || "").trim();
-  if (!PROVIDER_ID_RE.test(providerId)) throw new UsageError("providerId 格式不正确");
-  const modelId = String(input.modelId || "").trim();
-  if (!modelId || /\s/.test(modelId)) throw new UsageError("modelId 不能为空且不能含空白字符");
-  const mode = String(input.mode || "auto");
-  if (!["auto", "probe", "clear"].includes(mode)) throw new UsageError("mode 仅支持 auto / probe / clear");
-  const requested = mode === "clear" ? null : parseRequestedModalities(input);
-
-  // 找到实际声明了该模型的配置文件（优先级高者先，与 removeProvider 的 modelSource 口径一致）
-  const files = configCandidates().filter((f) => f.exists);
-  let hit = null;
-  for (let i = files.length - 1; i >= 0; i--) {
-    let own;
-    try {
-      own = JSON.parse(stripJsonc(fs.readFileSync(files[i].path, "utf8")));
-    } catch {
-      continue;
-    }
-    const block = isPlainObj(own?.provider) ? own.provider[providerId] : null;
-    const entry = isPlainObj(block) && isPlainObj(block.models) ? block.models[modelId] : null;
-    if (isPlainObj(entry)) {
-      hit = { file: files[i], raw: fs.readFileSync(files[i].path, "utf8"), own, block, entry };
-      break;
-    }
-  }
-  if (!hit) {
-    throw new UsageError(`模型 ${providerId}/${modelId} 未在配置文件中声明，请先通过「新增大模型」添加`);
-  }
-
-  if (mode === "clear") {
-    const { modalities: _drop, ...restEntry } = hit.entry;
-    const nextProvider = {
-      ...hit.own.provider,
-      [providerId]: { ...hit.block, models: { ...hit.block.models, [modelId]: restEntry } },
-    };
-    fs.writeFileSync(hit.file.path, setTopLevelValue(hit.raw, "provider", JSON.stringify(nextProvider)));
-    invalidateModelCache();
-    return {
-      providerId,
-      modelId,
-      mode,
-      configFile: hit.file.path,
-      capabilities: { modalities: null, source: "clear", confirmed: false, probe: null },
-      note: "已移除该模型的 modalities 声明；对新会话生效",
-    };
-  }
-
-  const catalog = await listModels();
-  const catalogModels = (catalog.models || []).filter((m) => m.providerID === providerId);
-  const caps = await resolveCapabilities({
-    requested,
-    catalogModel: catalogModels.find((m) => m.modelID === modelId) || null,
-    existingEntry: hit.entry,
-    npm: hit.block.npm,
-    baseURL: isPlainObj(hit.block.options) ? hit.block.options.baseURL : null,
-    apiKey: isPlainObj(hit.block.options) ? hit.block.options.apiKey : null,
-    modelId,
-    forceProbe: mode === "probe",
-  });
-
-  const nextProvider = {
-    ...hit.own.provider,
-    [providerId]: {
-      ...hit.block,
-      models: { ...hit.block.models, [modelId]: { ...hit.entry, modalities: caps.modalities } },
-    },
-  };
-  fs.writeFileSync(hit.file.path, setTopLevelValue(hit.raw, "provider", JSON.stringify(nextProvider)));
-  invalidateModelCache();
-
-  return {
-    providerId,
-    modelId,
-    mode,
-    configFile: hit.file.path,
-    capabilities: caps,
-    note: `已写入模型能力（来源：${CAP_SOURCE_CN[caps.source]}）；对新会话生效${
-      caps.source === "default" ? "，识图能力未确认" : ""
-    }`,
-  };
-}
 
 /** 删除自定义 provider：连带清理指向它的顶层 model 与运行态 recent/variant */
 export async function removeProvider(input = {}) {

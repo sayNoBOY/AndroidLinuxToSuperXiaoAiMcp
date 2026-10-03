@@ -9,9 +9,8 @@
  *   GET  /api/v1/server/llm         MiMoCode 大模型调用信息（配置文件 / 当前模型 / 模型目录 / 厂商预设，需 Bearer）
  *   POST /api/v1/server/llm/model   切换大模型（写回 mimocode 配置顶层 model + 运行态 recent，需 Bearer）
  *   POST /api/v1/server/llm/provider        新增大模型 provider（Claude/OpenAI/DeepSeek/千问/GLM/Kimi… 预设或自定义；
- *                                           成功后初始化模型能力 modalities（识图等），需 Bearer）
+ *                                           请求体 capabilities 六项布尔为手动能力标定（必填），写入 mimocode 配置，需 Bearer）
  *   POST /api/v1/server/llm/provider/remove 删除已配置的自定义 provider（连带清理其 model/recent，需 Bearer）
- *   POST /api/v1/server/llm/model/capabilities 模型能力初始化/重测/移除（存量补救，mode: auto/probe/clear，需 Bearer）
  *   POST /api/v1/server/reboot      重启服务器（页面底部唯一按钮；调用仓库根目录 restart.sh
  *                                   真实重启前后端——脚本第一步就 pkill 本进程，故响应发出后
  *                                   再 spawn 脚本；新进程启动即为 running，需 Bearer）
@@ -68,7 +67,6 @@ import {
   switchModel,
   addProvider,
   removeProvider,
-  initModelCapabilities,
   PROVIDER_PRESETS,
   ADAPTERS,
 } from "./MiMoCodeConfig.js";
@@ -562,10 +560,6 @@ export function mountSysApi(app) {
         isFavorite: cur.favorite.includes(m.key),
       }));
       const customProviders = summarizeProviders(merged.effective);
-      // 能力缺口：配置里缺合法 modalities 的模型（name-only 条目会被目录顶掉识图能力，需初始化）
-      const needsCapabilityInit = customProviders.flatMap((p) =>
-        p.models.filter((m) => !m.modalities).map((m) => `${p.id}/${m.modelId}`),
-      );
 
       return ok(res, {
         serverId,
@@ -585,7 +579,6 @@ export function mountSysApi(app) {
           modelGroups: cur.modelGroups,
           groupNames: cur.groupNames,
           customProviders,
-          needsCapabilityInit,
         },
         credentials,
         providers: [...new Set(models.map((m) => m.providerID))],
@@ -638,22 +631,6 @@ export function mountSysApi(app) {
       if (serverId === null) return;
 
       const r = await removeProvider(body);
-      return ok(res, { serverId, appliedAt: naiveOf(), ...r });
-    } catch (e) {
-      if (e instanceof UsageError) return badRequest(res, e.message);
-      next(e);
-    }
-  });
-
-  // POST /api/v1/server/llm/model/capabilities —— 模型能力(modalities)初始化/重测/移除
-  //   mode: auto(流水线) | probe(强制实测) | clear(移除声明)；显式 modalities/vision 等价 user 来源
-  router.post("/llm/model/capabilities", requireAuth, async (req, res, next) => {
-    try {
-      const body = req.body ?? {};
-      const serverId = resolveServerId(body.serverId, res);
-      if (serverId === null) return;
-
-      const r = await initModelCapabilities(body);
       return ok(res, { serverId, appliedAt: naiveOf(), ...r });
     } catch (e) {
       if (e instanceof UsageError) return badRequest(res, e.message);
