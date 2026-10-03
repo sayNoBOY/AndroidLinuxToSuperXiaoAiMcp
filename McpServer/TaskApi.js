@@ -50,8 +50,10 @@
  *
  * 数据库：SQLite（复用 LoginApi 的 getDb() 连接，库文件 data/suishen.db），
  * 首次挂载自动建表 tasks / task_messages（文档 §7）。
- * 时间：字段按 datetime('now','localtime') 存储（本机 TZ=UTC），接口输出统一
- * 转成文档要求的 ISO 8601 +08:00（与登录接口口径一致）。
+ * 时间：字段按 datetime('now','localtime') 存储 = 本机本地挂钟 naive 串；读取按
+ * 本地解析成真实时刻，接口输出统一转成文档要求的 ISO 8601 +08:00（与登录接口
+ * LoginApi、前端「直接切片墙上时钟」口径一致）。禁止用 toISOString().slice(0,19)
+ * 落库 —— 那是 UTC 基准，TZ=+8 主机会与 localtime 写入混存。
  *
  * 与文档的差异（均有原因）：
  * 1. tasks 表去掉 source/target 两条 devices 外键 —— devices 表尚不存在，
@@ -118,12 +120,23 @@ const NET_RESUME_SETTLE_MS = 8_000; // 恢复后先宽限自愈，再对仍静�
 
 const pad = (n) => String(n).padStart(2, "0");
 
-// 存储的 naive 时间按 UTC 解释，输出为文档要求的 +08:00（北京）表示
-function toISO(naiveUtc) {
-  if (!naiveUtc) return null;
-  const iso = String(naiveUtc).replace(" ", "T") + "Z";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return String(naiveUtc);
+// 本地挂钟 naive 串（"YYYY-MM-DD HH:mm:ss"）：落库统一用它替代
+// new Date().toISOString().slice(0,19)（那是 UTC 基准，会与 localtime 写入混存）
+function naiveNow(d = new Date()) {
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  );
+}
+
+// 存储的 naive 时间按本地挂钟解释（datetime('now','localtime')）：先按本地解析出
+// 真实时刻，再按文档/登录接口口径渲染为 ISO 8601 +08:00（前端直接切片墙上时钟）。
+// 不能补 "Z" 当 UTC 再 +8h —— 那会把本地挂钟多算一个时区偏移（本机 TZ=+8 时快 8h）
+function toISO(naive) {
+  if (!naive) return null;
+  const d = new Date(String(naive).replace(" ", "T")); // 不补 Z → JS 按本地时区解析
+  if (Number.isNaN(d.getTime())) return String(naive);
+  // 真实时刻 +8h 后按 UTC 字段渲染 = 恒为北京墙上时钟 +08:00，与主机时区无关
   const b = new Date(d.getTime() + 8 * 3600_000);
   return (
     `${b.getUTCFullYear()}-${pad(b.getUTCMonth() + 1)}-${pad(b.getUTCDate())}` +
@@ -132,13 +145,13 @@ function toISO(naiveUtc) {
 }
 
 function nowISO() {
-  return toISO(new Date().toISOString().slice(0, 19).replace("T", " "));
+  return toISO(naiveNow());
 }
 
-// 毫秒时间戳差（naive UTC 字符串 → 秒）
-function sinceSec(naiveUtc) {
-  if (!naiveUtc) return 0;
-  const t = Date.parse(String(naiveUtc).replace(" ", "T") + "Z");
+// 毫秒时间戳差（naive 本地挂钟字符串 → 秒）；不补 "Z"，按本地解析
+function sinceSec(naive) {
+  if (!naive) return 0;
+  const t = Date.parse(String(naive).replace(" ", "T"));
   if (Number.isNaN(t)) return 0;
   return Math.max(0, Math.round((Date.now() - t) / 1000));
 }
@@ -512,10 +525,10 @@ function addTokens(dst, tk) {
   return dst;
 }
 
-// 毫秒时间戳 → 文档口径 ISO 8601 +08:00
+// 毫秒时间戳 → 文档口径 ISO 8601 +08:00（先转本地挂钟再走 toISO）
 function msToISO(ms) {
   if (!ms) return null;
-  return toISO(new Date(ms).toISOString().slice(0, 19).replace("T", " "));
+  return toISO(naiveNow(new Date(ms)));
 }
 
 /** 轮次输入预览：取应用侧 task_messages 的原文（与消息记录页同源） */
@@ -718,7 +731,7 @@ async function syncArtifacts(taskId) {
   const records = db.prepare("SELECT * FROM task_artifacts WHERE task_id = ?").all(taskId);
   const byRel = new Map(records.map((r) => [r.rel_path, r]));
   const seen = new Set();
-  const nowNaive = new Date().toISOString().slice(0, 19).replace("T", " ");
+  const nowNaive = naiveNow();
   const out = [];
   let changed = false;
 
@@ -1211,7 +1224,7 @@ function finalizeRun(taskId, run, result) {
   const content = success ? answer || "(无文本输出)" : `执行失败：${detail || "未知错误"}`;
   const msgId = insertMsg(taskId, "assistant", content);
 
-  const nowNaive = new Date().toISOString().slice(0, 19).replace("T", " ");
+  const nowNaive = naiveNow();
   const duration = sinceSec(row.started_at || row.created_at);
   const newState = success ? "completed" : "failed";
   const progress = success ? 100 : row.progress ?? 0;
@@ -1262,7 +1275,7 @@ function dispatchNext(taskId, notifyDispatch = true) {
   if (!row || !row.session_id) return false; // 会话不存在：消息已消费但无法续跑
 
   if (row.state !== "running") {
-    const nowNaive = new Date().toISOString().slice(0, 19).replace("T", " ");
+    const nowNaive = naiveNow();
     db.prepare(
       "UPDATE tasks SET state='running', progress=0, error_message=NULL, completed_at=NULL, started_at=?, " +
         "updated_at=datetime('now', 'localtime') WHERE task_id=?"
@@ -1753,7 +1766,11 @@ export function mountTaskApi(app) {
     touchTask(taskId); // 继续会话即刷新更新时间（列表随之冒泡）
     if (!wasBusy) dispatchNext(taskId, false); // 空闲则立即派发（下面统一广播最终状态）
     const pending = !!(db.prepare("SELECT pending FROM task_messages WHERE msg_id = ?").get(userMsgId)?.pending);
-    const createdAt = toISO(new Date().toISOString().slice(0, 19).replace("T", " "));
+    // 读回落库行的 created_at（DEFAULT datetime('now','localtime')）→ 乐观插入
+    // 与刷新后的消息历史逐字节一致，不再用当前时刻现算
+    const createdAt = toISO(
+      db.prepare("SELECT created_at FROM task_messages WHERE msg_id = ?").get(userMsgId)?.created_at
+    );
     broadcast("task_message", {
       task_id: taskId,
       msg_id: formatMsgId(userMsgId),
@@ -1876,9 +1893,7 @@ export function mountTaskApi(app) {
         task_id: taskId,
         exists: true,
         content: text, // 全文：界面从最后一行往上显示并限两行（反转在前端做）
-        updated_at: st
-          ? toISO(new Date(st.mtimeMs).toISOString().slice(0, 19).replace("T", " "))
-          : null,
+        updated_at: st ? msToISO(st.mtimeMs) : null,
       });
     } catch (e) {
       if (e.code === "ENOENT") return ok(res, empty); // 还没写过 checkpoint：按不存在返回
@@ -1905,7 +1920,7 @@ export function mountTaskApi(app) {
         rel_path: a.rel_path,
         size: a.size,
         created_at: toISO(a.created_at),
-        mtime: a.mtimeMs != null ? toISO(new Date(a.mtimeMs).toISOString().slice(0, 19).replace("T", " ")) : null,
+        mtime: msToISO(a.mtimeMs),
       })),
     });
   });
@@ -1968,7 +1983,7 @@ export function mountTaskApi(app) {
     }
     // 排队消息永远不会跑：删除，避免任务已取消却残留 pending
     db.prepare("DELETE FROM task_messages WHERE task_id = ? AND pending = 1").run(taskId);
-    const nowNaive = new Date().toISOString().slice(0, 19).replace("T", " ");
+    const nowNaive = naiveNow();
     const duration = sinceSec(row.started_at || row.created_at);
     db.prepare(
       "UPDATE tasks SET state='cancelled', completed_at=?, duration_sec=?, error_message=NULL, " +
