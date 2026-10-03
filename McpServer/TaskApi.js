@@ -20,6 +20,9 @@
  *   PUT    /api/v1/tasks/{task_id}/cancel    取消任务（终止会话并丢弃排队消息，需 Bearer）
  *   DELETE /api/v1/tasks/{task_id}     删除任务（需 Bearer）
  *   DELETE /api/v1/tasks/completed     清空已完成任务（需 Bearer）
+ *   GET    /api/v1/tasks/{task_id}/checkpoint  会话 checkpoint 尾部两行（任务详情「执行中」
+ *                                            区每秒轮询；checkpoint.md 由 MiMoCode 的
+ *                                            checkpoint writer 维护在 memory/sessions/<sid>/）
  *   GET    /api/v1/tasks/{task_id}/artifacts  产物列表（扫描 taskRes/<id>/ 并同步表记录）
  *   GET    /api/v1/tasks/{task_id}/artifacts/{artifact_id}/download
  *           下载产物（附件下载；?inline=1 按内联预览；?token= 允许无 Authorization 头）
@@ -71,7 +74,7 @@ import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
-import { readdir, stat, mkdir, rm, rename, writeFile } from "node:fs/promises";
+import { readdir, stat, mkdir, rm, rename, writeFile, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import express from "express";
@@ -524,6 +527,7 @@ function roundPreview(content) {
 
 /**
  * 任务会话的调用统计：{ model, totals, rounds }。
+ * totals.context_tokens = 当前会话上下文大小（最近一次调用送入模型的上下文 token）。
  * 轮次口径 = 应用侧 task_messages 的 user 消息（与消息记录页的"轮"一致）；
  * mimocode 同一条消息可能因断线恢复被重复派发成多条 user 行 —— 按派发时间
  * 归并回所属应用轮次，助手调用再按 parentID 归轮（parent 缺失按时间就近）。
@@ -543,6 +547,8 @@ function buildSessionUsage(row) {
       duration_sec: 0,
       started_at: null,
       ended_at: null,
+      // 当前会话上下文大小：最近一次真实调用送入模型的上下文 token（见 buildSessionUsage 尾部）
+      context_tokens: 0,
     },
     rounds: [],
   };
@@ -628,6 +634,7 @@ function buildSessionUsage(row) {
 
   let firstMs = null;
   let lastMs = null;
+  let latestCall = null; // 最近一次真实调用（按完成时间），用于算当前会话上下文大小
   for (let i = 0; i < buckets.length; i++) {
     const b = buckets[i];
     const tk = zeroTokens();
@@ -636,6 +643,7 @@ function buildSessionUsage(row) {
     let end = null;
     const models = [];
     for (const c of b.calls) {
+      if (latestCall == null || c.end > latestCall.end) latestCall = c;
       addTokens(tk, c.tokens);
       cost += c.cost;
       start = start == null ? c.t : Math.min(start, c.t);
@@ -672,6 +680,11 @@ function buildSessionUsage(row) {
   data.totals.duration_sec = firstMs != null && lastMs != null ? Math.max(0, Math.round((lastMs - firstMs) / 1000)) : 0;
   data.totals.started_at = msToISO(firstMs);
   data.totals.ended_at = msToISO(lastMs);
+  // 当前会话上下文大小 = 最近一次调用送入模型的上下文（新输入 + 缓存读 + 缓存写），
+  // 即那次调用时占用的上下文窗口量；输出/推理不计入输入窗口，故不参与求和。
+  data.totals.context_tokens = latestCall
+    ? latestCall.tokens.input + latestCall.tokens.cache_read + latestCall.tokens.cache_write
+    : 0;
   return data;
 }
 
@@ -1815,7 +1828,8 @@ export function mountTaskApi(app) {
   });
 
   // GET /api/v1/tasks/{task_id}/usage —— 调用统计（任务卡图标点开的信息框数据源）：
-  // 当前会话调用的大模型 + 汇总 + 每轮对话的 token/费用/耗时（读 mimocode.db，只读不落库）
+  // 当前会话调用的大模型 + 汇总（含当前会话上下文大小 context_tokens）+ 每轮对话的
+  // token/费用/耗时（读 mimocode.db，只读不落库）
   router.get("/tasks/:taskId/usage", requireAuth, (req, res) => {
     const taskId = asInt(req.params.taskId);
     if (taskId == null) return badRequest(res, "task_id 无效");
@@ -1833,6 +1847,46 @@ export function mountTaskApi(app) {
         e.status === 503 ? "USAGE_DB_UNAVAILABLE" : "USAGE_READ_FAILED",
         e.message
       );
+    }
+  });
+
+  // GET /api/v1/tasks/{task_id}/checkpoint —— 会话 checkpoint 文件尾部（详情弹窗「执行中」区
+  // 每秒轮询）。文件 = <dataDir>/mimocode/memory/sessions/<session_id>/checkpoint.md（与
+  // getMimocodeDb 同口径的 dataDir）；只回最后 2 条非空行 —— 前端限定两行展示，避免整文件每秒回传。
+  router.get("/tasks/:taskId/checkpoint", requireAuth, async (req, res) => {
+    const taskId = asInt(req.params.taskId);
+    if (taskId == null) return badRequest(res, "task_id 无效");
+    const row = getOwnedTask(taskId, req.user.user_id);
+    if (!row) return fail(res, 404, "任务不存在", "TASK_NOT_FOUND");
+
+    const empty = { task_id: taskId, exists: false, content: "", updated_at: null };
+    const sid = row.session_id;
+    if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) return ok(res, empty); // 会话未建/非法 id：不拼路径
+
+    const dataDir =
+      process.env.MIMOCODE_HOME && path.isAbsolute(process.env.MIMOCODE_HOME)
+        ? path.join(process.env.MIMOCODE_HOME, "data")
+        : process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+    const file = path.join(dataDir, "mimocode", "memory", "sessions", sid, "checkpoint.md");
+
+    try {
+      const [text, st] = await Promise.all([readFile(file, "utf8"), stat(file).catch(() => null)]);
+      const lines = text
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(-2);
+      return ok(res, {
+        task_id: taskId,
+        exists: true,
+        content: lines.join("\n"),
+        updated_at: st
+          ? toISO(new Date(st.mtimeMs).toISOString().slice(0, 19).replace("T", " "))
+          : null,
+      });
+    } catch (e) {
+      if (e.code === "ENOENT") return ok(res, empty); // 还没写过 checkpoint：按不存在返回
+      return fail(res, 500, "checkpoint 读取失败", "CHECKPOINT_READ_FAILED", e.message);
     }
   });
 

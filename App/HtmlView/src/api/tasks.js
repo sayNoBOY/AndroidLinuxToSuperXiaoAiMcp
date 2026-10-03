@@ -134,6 +134,14 @@ export function getTaskUsage(taskId) {
 }
 
 /**
+ * GET /tasks/{id}/checkpoint — 会话 checkpoint 尾部两行（仅任务执行中时前端每秒轮询）。
+ * 返回 { exists, content, updated_at }；还没写过 checkpoint 时 exists=false、content=''。
+ */
+export function getTaskCheckpoint(taskId) {
+  return api(`/tasks/${taskId}/checkpoint`)
+}
+
+/**
  * 产物直链（供 <a href> / window.open 使用 —— 请求头带不了 Bearer，
  * 走后端 ?token= 兜底认证）。inline=1 时服务端不加 attachment 头，浏览器直接渲染。
  */
