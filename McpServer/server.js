@@ -1,3 +1,8 @@
+/**
+ * android-linux-to-super-xiao-ai-mcp — 原 stdio 版 MCP 服务器（保留未改动）
+ *
+ * 制作人：老实人留一手（抖音 / B站同名）
+ */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";

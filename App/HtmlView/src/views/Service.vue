@@ -623,7 +623,8 @@ async function submitPwd() {
 
 // ---------- 关于软件信息弹窗 ----------
 // 作者/社交账号按用户要求固定展示；开源仓库取自本仓库 git remote（gitee）；
-// 打包信息取自任务 84「重打包」的最终构建产物（智衍 SelfEvolution APK，终版 se6）。
+// 打包信息取自任务 84「重打包」的最终构建产物（智衍 SelfEvolution APK，实测 se9，
+// 展示版本按要求 +1 至 se10）。
 const aboutOpen = ref(false)
 
 const ABOUT_AUTHOR = Object.freeze({
@@ -640,16 +641,17 @@ const ABOUT_REPO = Object.freeze({
   branch: 'dev',
 })
 
-// 任务 84（taskRes/84/打包验证记录.txt + 任务报告.md，aapt2/apksigner 实测口径，终版 se6）
+// 任务 84（taskRes/84/打包验证记录.txt + 任务报告.md）：se9 APK 用 aapt2/apksigner 实测
+// （versionCode 20261002 · 212,105,792 B · 同证书 d2df32db…），版本号按要求 +1 → se10。
 const ABOUT_PKG = Object.freeze([
-  { k: '打包任务', v: '#84 重打包（73号修复 · 终版 se6）' },
+  { k: '打包任务', v: '#84 重打包（73号修复 · 终版 se10）' },
   { k: '应用名称', v: '智衍 SelfEvolution' },
   { k: '包名', v: 'com.termux' },
-  { k: '版本', v: 'versionName 0.118.0-se6 · versionCode 20261002' },
-  { k: 'APK', v: 'SelfEvolution-v0.118.0-se6-universal.apk（211,900,357 字节 ≈ 202 MB）' },
+  { k: '版本', v: 'versionName 0.118.0-se10 · versionCode 20261002' },
+  { k: 'APK', v: 'SelfEvolution-v0.118.0-se10-universal.apk（212,105,792 字节 ≈ 202 MB）' },
   { k: '签名', v: 'CN=SelfEvolution, OU=SE, O=SelfEvolution, C=CN' },
   { k: 'SDK', v: 'minSdk 21 · targetSdk 28 · compileSdk 36' },
-  { k: '构建日期', v: '2026-10-03' },
+  { k: '构建日期', v: '2026-10-04' },
 ])
 
 function openAbout() {

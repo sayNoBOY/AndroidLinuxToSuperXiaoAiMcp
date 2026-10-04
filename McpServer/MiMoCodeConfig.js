@@ -24,6 +24,8 @@
  *      不写明文 apiKey；probe 实测同用登录凭据打登录网关（凭据绝不发往第三方端点）。
  *
  * 安全：模型/凭据 DTO 全部走白名单字段，CLI 的 options/headers 与 auth.json 的 key 不落响应。
+ *
+ * 制作人：老实人留一手（抖音 / B站同名）
  */
 import fs from "node:fs";
 import os from "node:os";

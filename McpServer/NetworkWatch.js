@@ -22,6 +22,8 @@
  * 可用环境变量覆盖探测目标：NET_PROBE_TARGETS="host:port,host:port"、
  * NET_PROBE_DOMAIN=example.com、NET_PROBE_INTERVAL_MS=5000、
  * NET_PROBE_TIMEOUT_MS=3000、NET_PROBE_FAIL_THRESHOLD=2。
+ *
+ * 制作人：老实人留一手（抖音 / B站同名）
  */
 import net from "node:net";
 import dns from "node:dns";

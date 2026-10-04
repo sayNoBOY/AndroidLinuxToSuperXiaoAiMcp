@@ -1,3 +1,8 @@
+/**
+ * android-linux-to-super-xiao-ai-mcp — MCP Streamable HTTP 路由与 4 个工具实现
+ *
+ * 制作人：老实人留一手（抖音 / B站同名）
+ */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { randomUUID } from "node:crypto";

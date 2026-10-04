@@ -3,10 +3,27 @@
 让小爱同学(或任意支持 **Streamable HTTP** 的 MCP 客户端)接入本机能力的 MCP 服务器。
 运行环境是一台跑在 Android 上的 Debian(aarch64),因此工具可以直接操作手机共享存储、执行命令、调用 MiMoCode 等。
 
-- `http-server.js` — 服务入口:创建 express app、挂载 `/mcp` 与登录认证接口、监听端口 3000
+**制作人:老实人留一手**
+
+- `http-server.js` — 服务入口:创建 express app、挂载 `/mcp` 与各业务接口、监听端口 3000
 - `McpApi.js` — MCP 服务实现:4 个工具定义与 `/mcp` 路由(POST/GET/DELETE 与会话管理)
 - `LoginApi.js` — 登录认证接口:`/api/v1/auth` 下的 login/refresh/logout/me(SQLite + JWT),随 http-server 一起启动,也可 `node LoginApi.js` 单独跑(同为 3000 端口)
+- `TaskApi.js` — 任务管理接口:`/api/v1/tasks`、参考物上传、产物下载与 `ws://…/ws/tasks` 事件推送
+- `SysApi.js` — 「我的」Tab 的系统状态、指标、操作日志与大模型信息接口
+- `OpLog.js` — 全局操作日志:在应用层统一记录所有业务接口的动作与结果
+- `MiMoCodeConfig.js` — 大模型配置读取 / 切换,供 SysApi 使用
+- `NetworkWatch.js` — 网络通断探测:离线挂起任务派发,恢复后续跑
 - `server.js` — 原 stdio 版 MCP 服务器(保留未改动)
+
+## 制作人
+
+| 项目 | 信息 |
+| --- | --- |
+| 制作人 / 软件作者 | 老实人留一手 |
+| 抖音账号 | 老实人留一手 |
+| B站账号 | 老实人留一手 |
+
+> 本目录各 `.js` 源文件头部、`package.json` 的 `author` 字段均标注了制作人;前端「关于软件信息」弹窗的「软件作者」为同一人。
 
 ## 快速开始
 
@@ -57,3 +74,5 @@ Login API running at http://0.0.0.0:3000/api/v1/auth
 ## License
 
 [MIT](../LICENSE) © 2026 刘春卫
+
+**制作人:老实人留一手**(抖音 / B站同名)

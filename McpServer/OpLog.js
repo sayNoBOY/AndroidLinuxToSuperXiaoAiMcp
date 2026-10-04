@@ -18,6 +18,8 @@
  *
  * 挂载：http-server.js / 各独立入口在 express.json 之后、业务路由之前调用
  *       mountOperationLog(app) —— 必须先于路由注册，finish 监听才对所有请求生效。
+ *
+ * 制作人：老实人留一手（抖音 / B站同名）
  */
 import { getDb } from "./LoginApi.js";
 

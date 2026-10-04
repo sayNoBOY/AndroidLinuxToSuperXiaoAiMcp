@@ -1,6 +1,8 @@
 {
   "name": "my-mcp-server",
   "version": "1.0.0",
+  "description": "android-linux-to-super-xiao-ai-mcp — 让小爱同学接入本机能力的 MCP 服务器（Streamable HTTP）",
+  "author": "老实人留一手",
   "type": "module",
   "dependencies": {
     "@modelcontextprotocol/sdk": "latest",

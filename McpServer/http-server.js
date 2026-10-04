@@ -1,3 +1,8 @@
+/**
+ * android-linux-to-super-xiao-ai-mcp — HTTP 服务入口：创建 express 应用并监听 3000 端口
+ *
+ * 制作人：老实人留一手（抖音 / B站同名）
+ */
 import express from "express";
 
 import { mountMcpApi } from "./McpApi.js";
