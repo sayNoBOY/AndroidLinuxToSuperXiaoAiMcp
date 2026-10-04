@@ -51,9 +51,10 @@
  * 数据库：SQLite（复用 LoginApi 的 getDb() 连接，库文件 data/suishen.db），
  * 首次挂载自动建表 tasks / task_messages（文档 §7）。
  * 时间：字段按 datetime('now','localtime') 存储 = 本机本地挂钟 naive 串；读取按
- * 本地解析成真实时刻，接口输出统一转成文档要求的 ISO 8601 +08:00（与登录接口
- * LoginApi、前端「直接切片墙上时钟」口径一致）。禁止用 toISOString().slice(0,19)
- * 落库 —— 那是 UTC 基准，TZ=+8 主机会与 localtime 写入混存。
+ * 本地解析成真实时刻，接口输出 ISO 8601 带**本机真实偏移**（东八区即文档要求的
+ * +08:00），与登录接口 LoginApi、前端「直接切片墙上时钟」口径一致 —— 切片得到的
+ * 墙上时钟恒等于本机 date，不会比系统时间快一个时区差。禁止用
+ * toISOString().slice(0,19) 落库 —— 那是 UTC 基准，会与 localtime 写入混存。
  *
  * 与文档的差异（均有原因）：
  * 1. tasks 表去掉 source/target 两条 devices 外键 —— devices 表尚不存在，
@@ -71,6 +72,8 @@
  * 挂载方式：import { mountTaskApi, attachTaskWs } from "./TaskApi.js";
  *           mountTaskApi(app); const server = app.listen(...); attachTaskWs(server);
  * 独立运行：node TaskApi.js  （会同时挂载登录接口 —— 任务接口依赖其认证）
+ *
+ * 制作人：老实人留一手（抖音 / B站同名）
  */
 import path from "node:path";
 import os from "node:os";
@@ -130,17 +133,27 @@ function naiveNow(d = new Date()) {
 }
 
 // 存储的 naive 时间按本地挂钟解释（datetime('now','localtime')）：先按本地解析出
-// 真实时刻，再按文档/登录接口口径渲染为 ISO 8601 +08:00（前端直接切片墙上时钟）。
+// 真实时刻，再按本机墙上时钟 + 本机真实偏移渲染 ISO 8601（前端直接切片）。
 // 不能补 "Z" 当 UTC 再 +8h —— 那会把本地挂钟多算一个时区偏移（本机 TZ=+8 时快 8h）
 function toISO(naive) {
   if (!naive) return null;
   const d = new Date(String(naive).replace(" ", "T")); // 不补 Z → JS 按本地时区解析
   if (Number.isNaN(d.getTime())) return String(naive);
-  // 真实时刻 +8h 后按 UTC 字段渲染 = 恒为北京墙上时钟 +08:00，与主机时区无关
-  const b = new Date(d.getTime() + 8 * 3600_000);
+  return isoLocal(d);
+}
+
+// Date → "YYYY-MM-DDTHH:mm:ss±HH:MM"：本机墙上时钟 + 本机真实偏移。
+// 东八区主机输出 +08:00（文档/登录接口口径），其它时区输出各自偏移 —— 两者切片出
+// 的墙上时钟都恒等于本机 date，ISO 也仍是正确瞬时。此前硬渲染北京时间 +08:00，
+// 在 TZ≠+8 的主机上会让卡片时间比系统时间快一个时区差（本机 UTC 快 8 小时、落在未来）。
+function isoLocal(d) {
+  const off = -d.getTimezoneOffset(); // 分钟，东为正（UTC+8 → 480，UTC → 0）
+  const sign = off < 0 ? "-" : "+";
+  const a = Math.abs(off);
   return (
-    `${b.getUTCFullYear()}-${pad(b.getUTCMonth() + 1)}-${pad(b.getUTCDate())}` +
-    `T${pad(b.getUTCHours())}:${pad(b.getUTCMinutes())}:${pad(b.getUTCSeconds())}+08:00`
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` +
+    `${sign}${pad(Math.floor(a / 60))}:${pad(a % 60)}`
   );
 }
 
@@ -525,7 +538,7 @@ function addTokens(dst, tk) {
   return dst;
 }
 
-// 毫秒时间戳 → 文档口径 ISO 8601 +08:00（先转本地挂钟再走 toISO）
+// 毫秒时间戳 → 文档口径 ISO 8601（本机墙上时钟 + 本机偏移；先转本地挂钟再走 toISO）
 function msToISO(ms) {
   if (!ms) return null;
   return toISO(naiveNow(new Date(ms)));

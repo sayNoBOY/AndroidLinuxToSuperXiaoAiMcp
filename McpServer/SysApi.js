@@ -47,6 +47,8 @@
  *
  * 挂载方式：import { mountSysApi } from "./SysApi.js"; mountSysApi(app);
  * 独立运行：node SysApi.js  （会同时挂载登录接口 —— 系统接口依赖其认证）
+ *
+ * 制作人：老实人留一手（抖音 / B站同名）
  */
 import os from "node:os";
 import path from "node:path";
@@ -85,13 +87,21 @@ const CPU_SAMPLE_MS = 200; // CPU 首次采样两次读取的间隔
 
 const pad = (n) => String(n).padStart(2, "0");
 
-function nowISO() {
-  const d = new Date();
-  const t = new Date(d.getTime() + (8 * 60 + d.getTimezoneOffset()) * 60000);
+// 本机墙上时钟 + 本机真实偏移（东八区即 +08:00）：与 TaskApi.toISO / LoginApi 同口径，
+// 切片出的墙上时钟恒等于本机 date；硬编码 +08:00 会在 TZ≠+8 的主机上快一个时区差
+function isoLocal(d) {
+  const off = -d.getTimezoneOffset(); // 分钟，东为正（UTC+8 → 480，UTC → 0）
+  const sign = off < 0 ? "-" : "+";
+  const a = Math.abs(off);
   return (
-    `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}` +
-    `T${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}+08:00`
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` +
+    `${sign}${pad(Math.floor(a / 60))}:${pad(a % 60)}`
   );
+}
+
+function nowISO() {
+  return isoLocal(new Date());
 }
 
 // 文档时间格式：yyyy-MM-dd HH:mm:ss（本地时间）

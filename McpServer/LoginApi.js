@@ -12,6 +12,8 @@
  * 挂载方式：import { mountLoginApi } from "./LoginApi.js"; mountLoginApi(app);
  * 独立运行：node LoginApi.js  （默认 0.0.0.0:3000，与文档 Base URL 一致）
  * 导出：getDb / requireAuth / verifyAccessToken / isPrivateOrigin（TaskApi.js 复用认证与 CORS 策略）
+ *
+ * 制作人：老实人留一手（抖音 / B站同名）
  */
 import path from "node:path";
 import fs from "node:fs";
@@ -40,14 +42,21 @@ const MIN_PASSWORD_LEN = 6; // 修改密码：新密码最短长度
 
 const pad = (n) => String(n).padStart(2, "0");
 
-function nowISO() {
-  // 文档要求 ISO 8601 且带 +08:00 偏移
-  const d = new Date();
-  const t = new Date(d.getTime() + (8 * 60 + d.getTimezoneOffset()) * 60000);
+// 本机墙上时钟 + 本机真实偏移（东八区即文档要求的 +08:00）：与 TaskApi / SysApi 同口径，
+// 切片出的墙上时钟恒等于本机 date；硬编码 +08:00 会在 TZ≠+8 的主机上快一个时区差
+function isoLocal(d) {
+  const off = -d.getTimezoneOffset(); // 分钟，东为正（UTC+8 → 480，UTC → 0）
+  const sign = off < 0 ? "-" : "+";
+  const a = Math.abs(off);
   return (
-    `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}` +
-    `T${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}+08:00`
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` +
+    `${sign}${pad(Math.floor(a / 60))}:${pad(a % 60)}`
   );
+}
+
+function nowISO() {
+  return isoLocal(new Date());
 }
 
 function ok(res, data = null) {
