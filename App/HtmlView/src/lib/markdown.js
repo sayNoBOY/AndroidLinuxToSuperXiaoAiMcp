@@ -4,6 +4,7 @@
 
 import { Marked } from 'marked'
 import DOMPurify from 'dompurify'
+import { t } from '../i18n/index.js'
 import hljs from 'highlight.js/lib/core'
 import bash from 'highlight.js/lib/languages/bash'
 import c from 'highlight.js/lib/languages/c'
@@ -135,7 +136,7 @@ export function renderMarkdown(src, ctx = {}) {
     const copy = document.createElement('button')
     copy.type = 'button'
     copy.className = 'md-code-copy'
-    copy.textContent = '复制'
+    copy.textContent = t('common.copy')
     bar.append(label, copy)
     // 先把 pre 换成 wrap，再把 pre 挂进去；顺序反了会变成“用包含 pre 的节点替换 pre”
     pre.replaceWith(wrap)

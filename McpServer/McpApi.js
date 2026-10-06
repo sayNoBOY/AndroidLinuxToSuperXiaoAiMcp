@@ -11,6 +11,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 import { z } from "zod";
+import { toolDescription, toolParamDesc, resultText } from "./mcpText.js";
 
 const VIDEO_DIR = "/mnt/shared/Video"; // Android 共享存储中的 Video 目录
 const CONTENT_LIMIT = 100 * 1024; // 单文件最多返回 100KB
@@ -66,12 +67,12 @@ async function readFileSnippet(full) {
     const buf = await fs.readFile(full);
     const slice = buf.subarray(0, CONTENT_LIMIT);
     if (slice.includes(0)) {
-      return `【二进制文件，${stat.size} 字节，不返回内容】`;
+      return resultText("file.binary", { size: stat.size });
     }
     const truncated = buf.length > CONTENT_LIMIT;
-    return slice.toString("utf-8") + (truncated ? "\n……（内容已截断）" : "");
+    return slice.toString("utf-8") + (truncated ? `\n${resultText("file.truncated")}` : "");
   } catch (e) {
-    return `【读取失败: ${e.message}】`;
+    return resultText("file.readFail", { msg: e.message });
   }
 }
 
@@ -83,13 +84,13 @@ function createServer() {
 
   server.tool(
     "run_command",
-    "在设备上执行shell命令",
-    { command: z.string().describe("要执行的命令") },
+    toolDescription("run_command"),
+    { command: z.string().describe(toolParamDesc("run_command", "command")) },
     async ({ command }) => {
       const { execSync } = await import("child_process");
       try {
         const output = execSync(command, { encoding: "utf-8", timeout: 10000 });
-        return { content: [{ type: "text", text: output || "执行成功（无输出）" }] };
+        return { content: [{ type: "text", text: output || resultText("run.noOutput") }] };
       } catch (e) {
         return { content: [{ type: "text", text: e.message }] };
       }
@@ -98,12 +99,12 @@ function createServer() {
 
   server.tool(
     "get_find_file",
-    "查找系统中的相关文件并发送返回：按文件名关键词或通配符（如 *.log、report*）搜索，返回匹配的文件路径，可选返回文件内容",
+    toolDescription("get_find_file"),
     {
-      query: z.string().describe("搜索条件：文件名关键词或通配符模式，如 report 或 *.log"),
-      root: z.string().optional().describe("搜索起始目录，默认为用户主目录"),
-      include_content: z.boolean().optional().describe("是否同时返回文件内容（默认 false，只返回路径）"),
-      max_results: z.number().int().min(1).max(100).optional().describe("最多返回的文件数，默认 20"),
+      query: z.string().describe(toolParamDesc("get_find_file", "query")),
+      root: z.string().optional().describe(toolParamDesc("get_find_file", "root")),
+      include_content: z.boolean().optional().describe(toolParamDesc("get_find_file", "include_content")),
+      max_results: z.number().int().min(1).max(100).optional().describe(toolParamDesc("get_find_file", "max_results")),
     },
     async ({ query, root, include_content, max_results }) => {
       const startDir = root ? path.resolve(root) : os.homedir();
@@ -113,15 +114,15 @@ function createServer() {
       try {
         stat = await fs.stat(startDir);
       } catch {
-        return { content: [{ type: "text", text: `起始目录不存在: ${startDir}` }] };
+        return { content: [{ type: "text", text: resultText("find.rootMissing", { dir: startDir }) }] };
       }
       if (!stat.isDirectory()) {
-        return { content: [{ type: "text", text: `起始路径不是目录: ${startDir}` }] };
+        return { content: [{ type: "text", text: resultText("find.notDir", { dir: startDir }) }] };
       }
 
       const paths = await searchFiles(startDir, query, limit);
       if (paths.length === 0) {
-        return { content: [{ type: "text", text: `在 ${startDir} 下未找到匹配 "${query}" 的文件` }] };
+        return { content: [{ type: "text", text: resultText("find.none", { dir: startDir, query }) }] };
       }
 
       // 找到完整路径后，复制到 /sdcard/Documents/（文件名加序号前缀，避免同名覆盖）
@@ -148,12 +149,12 @@ function createServer() {
       }
 
       const copyReport =
-        (copied.length > 0 ? `已复制 ${copied.length} 个文件到 ${COPY_DIR}:\n` + copied.map((p, i) => `${i + 1}. ${p}`).join("\n") : "") +
-        (failed.length > 0 ? `\n复制失败 ${failed.length} 个:\n` + failed.join("\n") : "");
+        (copied.length > 0 ? `${resultText("find.copyOk", { n: copied.length, dir: COPY_DIR })}\n` + copied.map((p, i) => `${i + 1}. ${p}`).join("\n") : "") +
+        (failed.length > 0 ? `\n${resultText("find.copyFail", { n: failed.length })}\n` + failed.join("\n") : "");
 
       if (!include_content) {
         const list = paths.map((p, i) => `${i + 1}. ${p}`).join("\n");
-        return { content: [{ type: "text", text: `找到 ${paths.length} 个文件:\n${list}\n\n${copyReport}` }] };
+        return { content: [{ type: "text", text: `${resultText("find.found", { n: paths.length })}\n${list}\n\n${copyReport}` }] };
       }
 
       const parts = [];
@@ -167,15 +168,15 @@ function createServer() {
 
   server.tool(
     "ask_mimocode",
-    "把消息发给 MiMoCode agent 无头执行并返回其回答。支持传入 session_id 续接多轮对话",
+    toolDescription("ask_mimocode"),
     {
-      message: z.string().describe("要发给 MiMoCode 的消息/任务"),
+      message: z.string().describe(toolParamDesc("ask_mimocode", "message")),
       session_id: z
         .string()
         .optional()
-        .describe("续接已有会话时传入上次返回的 session_id；首次调用留空"),
-      model: z.string().optional().describe("可选，指定 provider/model"),
-      cwd: z.string().optional().describe("可选，agent 的工作目录，默认为用户主目录"),
+        .describe(toolParamDesc("ask_mimocode", "session_id")),
+      model: z.string().optional().describe(toolParamDesc("ask_mimocode", "model")),
+      cwd: z.string().optional().describe(toolParamDesc("ask_mimocode", "cwd")),
     },
     async ({ message, session_id, model, cwd }) => {
       const args = ["run", message, "--format", "json"];
@@ -186,10 +187,10 @@ function createServer() {
       try {
         const stat = await fs.stat(workdir);
         if (!stat.isDirectory()) {
-          return { content: [{ type: "text", text: `工作目录不存在: ${workdir}` }] };
+          return { content: [{ type: "text", text: resultText("ask.workdirMissing", { dir: workdir }) }] };
         }
       } catch {
-        return { content: [{ type: "text", text: `工作目录不存在: ${workdir}` }] };
+        return { content: [{ type: "text", text: resultText("ask.workdirMissing", { dir: workdir }) }] };
       }
 
       const raw = await new Promise((resolve) => {
@@ -233,7 +234,13 @@ function createServer() {
       if (raw.error && !answer) {
         return {
           content: [
-            { type: "text", text: `mimo run 失败: ${raw.error.message}\n${raw.stderr.slice(0, 2000)}` },
+            {
+              type: "text",
+              text: resultText("ask.runFail", {
+                msg: raw.error.message,
+                stderr: raw.stderr.slice(0, 2000),
+              }),
+            },
           ],
           isError: true,
         };
@@ -243,7 +250,8 @@ function createServer() {
         content: [
           {
             type: "text",
-            text: `${answer || "(无文本输出)"}\n\n---\nsession_id: ${sid ?? "未知"}`,
+            // answer 是 MiMoCode 生成内容，不翻译；session_id 有值时保留协议字段名原文
+            text: `${answer || resultText("ask.noOutput")}\n\n---\n${sid ? `session_id: ${sid}` : resultText("ask.sidUnknown")}`,
           },
         ],
       };
@@ -252,21 +260,21 @@ function createServer() {
 
   server.tool(
     "video_upload",
-    "通过 HTTP 上传文件到 Video 目录：内容以 base64 传入，保存到 Video/<年月日>/ 子文件夹，文件名保持原名（撞名自动加序号）",
+    toolDescription("video_upload"),
     {
-      filename: z.string().describe("保存的文件名，如 holiday.mp4"),
-      content: z.string().describe("文件内容的 base64 编码"),
+      filename: z.string().describe(toolParamDesc("video_upload", "filename")),
+      content: z.string().describe(toolParamDesc("video_upload", "content")),
       date: z
         .string()
         .regex(/^\d{8}$/)
         .optional()
-        .describe("子文件夹名 YYYYMMDD，默认为今天"),
+        .describe(toolParamDesc("video_upload", "date")),
     },
     async ({ filename, content, date }) => {
       // 文件名清洗：只取 basename，防止路径穿越
       const safeName = path.basename(filename).replace(/[\x00-\x1f]/g, "").trim();
       if (!safeName || safeName === "." || safeName === "..") {
-        return { content: [{ type: "text", text: `非法文件名: ${filename}` }], isError: true };
+        return { content: [{ type: "text", text: resultText("upload.badName", { name: filename }) }], isError: true };
       }
 
       const now = new Date();
@@ -279,10 +287,10 @@ function createServer() {
       try {
         buf = Buffer.from(content, "base64");
       } catch {
-        return { content: [{ type: "text", text: "content 不是合法的 base64" }], isError: true };
+        return { content: [{ type: "text", text: resultText("upload.badBase64") }], isError: true };
       }
       if (buf.length === 0) {
-        return { content: [{ type: "text", text: "文件内容为空" }], isError: true };
+        return { content: [{ type: "text", text: resultText("upload.empty") }], isError: true };
       }
 
       try {
@@ -300,11 +308,11 @@ function createServer() {
         const kb = (buf.length / 1024).toFixed(1);
         return {
           content: [
-            { type: "text", text: `上传成功\n路径: ${dest}\n大小: ${kb} KB` },
+            { type: "text", text: resultText("upload.ok", { dest, kb }) },
           ],
         };
       } catch (e) {
-        return { content: [{ type: "text", text: `保存失败: ${e.message}` }], isError: true };
+        return { content: [{ type: "text", text: resultText("upload.saveFail", { msg: e.message }) }], isError: true };
       }
     }
   );

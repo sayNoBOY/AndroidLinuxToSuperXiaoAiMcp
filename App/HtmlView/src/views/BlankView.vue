@@ -1,5 +1,6 @@
 <script setup>
 import { push } from '../router.js'
+import { t } from '../i18n/index.js'
 
 // 空白页：底部导航第三个 Tab，占位画布 —— 页面只显示引导提示，
 // 内容由用户后续通过任务对话自由添加（本期不预置任何组件）。
@@ -16,7 +17,7 @@ import { push } from '../router.js'
           <path d="M12 18v-6" />
           <path d="M9 15h6" />
         </svg>
-        <p class="blank-txt">空白页随你所想，通过任务对话添加你想要的内容</p>
+        <p class="blank-txt">{{ t('blank.hint') }}</p>
       </div>
     </div>
 
@@ -24,18 +25,18 @@ import { push } from '../router.js'
     <div class="tabbar">
       <div class="tab" @click="push('/')">
         <svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg>
-        <span>首页</span>
+        <span>{{ t('common.tab.home') }}</span>
       </div>
       <div class="tab on">
         <svg viewBox="0 0 24 24">
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
           <path d="M14 2v6h6" />
         </svg>
-        <span>空白</span>
+        <span>{{ t('common.tab.blank') }}</span>
       </div>
       <div class="tab" @click="push('/service')">
         <svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></svg>
-        <span>我的</span>
+        <span>{{ t('common.tab.me') }}</span>
       </div>
     </div>
   </div>

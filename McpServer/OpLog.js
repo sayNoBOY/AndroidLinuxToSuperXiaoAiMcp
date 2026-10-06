@@ -4,6 +4,8 @@
  * 覆盖本服务**所有业务接口**（登录认证 / 任务管理 / 参考物上传 / MCP / 系统操作），
  * 在应用层挂 res 'finish' 中间件统一留痕：动作（action）按「方法 + 路径」识别成
  * 中文功能名（见 ACTION_RULES），响应后异步写入 operation_log；读取端在 SysApi。
+ * 每条规则带稳定 key（action_key 列）：action 是中文原文（老前端直接显示），
+ * action_key 供前端 i18n 语言包 oplog.<key> 翻译，key 不存在/为 null 时前端回退 action 原文。
  * 例外：「我的」页 10s 轮询的 status/metrics、大模型信息读取 llm 与任务详情每秒轮询的
  * checkpoint 不记录（打开页面/跑任务即刷屏）。
  *
@@ -33,57 +35,59 @@ let pruneTimer = null;
 
 // ---------------------------------------------------------------------------
 // 中文动作映射：有序正则表（先匹配先生效，带参数的模式放精确规则之后）
-// path = 写入 api_path 的路由模式（聚合友好），action = 中文功能名
+// path  = 写入 api_path 的路由模式（聚合友好），action = 中文功能名，
+// key   = 稳定 action_key（前端语言包 oplog.<key> 翻译用；POST /mcp 由 mcpAction 动态返回）
 // ---------------------------------------------------------------------------
 
 const ACTION_RULES = [
   // —— 登录认证（LoginApi /api/v1/auth）——
-  { re: /^POST \/api\/v1\/auth\/login$/, path: "/api/v1/auth/login", action: "登录" },
-  { re: /^POST \/api\/v1\/auth\/refresh$/, path: "/api/v1/auth/refresh", action: "刷新访问令牌" },
-  { re: /^POST \/api\/v1\/auth\/logout$/, path: "/api/v1/auth/logout", action: "退出登录" },
-  { re: /^GET \/api\/v1\/auth\/me$/, path: "/api/v1/auth/me", action: "获取当前用户信息" },
-  { re: /^POST \/api\/v1\/auth\/change-password$/, path: "/api/v1/auth/change-password", action: "修改密码" },
+  { re: /^POST \/api\/v1\/auth\/login$/, path: "/api/v1/auth/login", action: "登录", key: "auth.login" },
+  { re: /^POST \/api\/v1\/auth\/refresh$/, path: "/api/v1/auth/refresh", action: "刷新访问令牌", key: "auth.refresh" },
+  { re: /^POST \/api\/v1\/auth\/logout$/, path: "/api/v1/auth/logout", action: "退出登录", key: "auth.logout" },
+  { re: /^GET \/api\/v1\/auth\/me$/, path: "/api/v1/auth/me", action: "获取当前用户信息", key: "auth.me" },
+  { re: /^POST \/api\/v1\/auth\/change-password$/, path: "/api/v1/auth/change-password", action: "修改密码", key: "auth.changePassword" },
 
   // —— 任务管理（TaskApi /api/v1/tasks）——
-  { re: /^GET \/api\/v1\/tasks$/, path: "/api/v1/tasks", action: "查询任务列表" },
-  { re: /^POST \/api\/v1\/tasks$/, path: "/api/v1/tasks", action: "创建任务" },
+  { re: /^GET \/api\/v1\/tasks$/, path: "/api/v1/tasks", action: "查询任务列表", key: "task.list" },
+  { re: /^POST \/api\/v1\/tasks$/, path: "/api/v1/tasks", action: "创建任务", key: "task.create" },
   // completed 必须在通配 :taskId 之前（DELETE /tasks/completed 两者都能匹配）
-  { re: /^DELETE \/api\/v1\/tasks\/completed$/, path: "/api/v1/tasks/completed", action: "清空已完成任务" },
-  { re: /^GET \/api\/v1\/tasks\/[^/]+$/, path: "/api/v1/tasks/:taskId", action: "查看任务详情" },
-  { re: /^POST \/api\/v1\/tasks\/[^/]+\/send$/, path: "/api/v1/tasks/:taskId/send", action: "发送任务消息" },
-  { re: /^GET \/api\/v1\/tasks\/[^/]+\/messages$/, path: "/api/v1/tasks/:taskId/messages", action: "查看消息记录" },
-  { re: /^GET \/api\/v1\/tasks\/[^/]+\/usage$/, path: "/api/v1/tasks/:taskId/usage", action: "查看调用统计" },
+  { re: /^DELETE \/api\/v1\/tasks\/completed$/, path: "/api/v1/tasks/completed", action: "清空已完成任务", key: "task.clearCompleted" },
+  { re: /^GET \/api\/v1\/tasks\/[^/]+$/, path: "/api/v1/tasks/:taskId", action: "查看任务详情", key: "task.detail" },
+  { re: /^POST \/api\/v1\/tasks\/[^/]+\/send$/, path: "/api/v1/tasks/:taskId/send", action: "发送任务消息", key: "task.send" },
+  { re: /^GET \/api\/v1\/tasks\/[^/]+\/messages$/, path: "/api/v1/tasks/:taskId/messages", action: "查看消息记录", key: "task.messages" },
+  { re: /^GET \/api\/v1\/tasks\/[^/]+\/usage$/, path: "/api/v1/tasks/:taskId/usage", action: "查看调用统计", key: "task.usage" },
   // /tasks/:taskId/checkpoint 是任务详情「执行中」区每秒轮询的读取接口，
   // 与 status/metrics 同规则不记（否则任务一跑日志即刷屏）。
-  { re: /^PUT \/api\/v1\/tasks\/[^/]+\/cancel$/, path: "/api/v1/tasks/:taskId/cancel", action: "取消任务" },
-  { re: /^DELETE \/api\/v1\/tasks\/[^/]+$/, path: "/api/v1/tasks/:taskId", action: "删除任务" },
-  { re: /^GET \/api\/v1\/tasks\/[^/]+\/artifacts$/, path: "/api/v1/tasks/:taskId/artifacts", action: "查看任务产物" },
+  { re: /^PUT \/api\/v1\/tasks\/[^/]+\/cancel$/, path: "/api/v1/tasks/:taskId/cancel", action: "取消任务", key: "task.cancel" },
+  { re: /^DELETE \/api\/v1\/tasks\/[^/]+$/, path: "/api/v1/tasks/:taskId", action: "删除任务", key: "task.delete" },
+  { re: /^GET \/api\/v1\/tasks\/[^/]+\/artifacts$/, path: "/api/v1/tasks/:taskId/artifacts", action: "查看任务产物", key: "task.artifacts" },
   {
     re: /^GET \/api\/v1\/tasks\/[^/]+\/artifacts\/[^/]+\/download$/,
     path: "/api/v1/tasks/:taskId/artifacts/:artifactId/download",
     action: "下载任务产物",
+    key: "task.download",
   },
 
   // —— 参考物分步上传（TaskApi /api/v1/uploads）——
-  { re: /^POST \/api\/v1\/uploads$/, path: "/api/v1/uploads", action: "上传参考物" },
+  { re: /^POST \/api\/v1\/uploads$/, path: "/api/v1/uploads", action: "上传参考物", key: "upload.create" },
 
   // —— 系统状态 / 我的 Tab（SysApi /api/v1/server）——
   // status/metrics 是「我的」页 10s 轮询，不记（否则打开页面即刷屏，
   // 用户明确要求剔除）；只留用户主动操作：查日志、重启服务器。
-  { re: /^GET \/api\/v1\/server\/logs\/all$/, path: "/api/v1/server/logs/all", action: "查询全部日志" },
-  { re: /^GET \/api\/v1\/server\/logs$/, path: "/api/v1/server/logs", action: "查询最近日志" },
-  { re: /^POST \/api\/v1\/server\/reboot$/, path: "/api/v1/server/reboot", action: "重启服务器" },
+  { re: /^GET \/api\/v1\/server\/logs\/all$/, path: "/api/v1/server/logs/all", action: "查询全部日志", key: "server.logsAll" },
+  { re: /^GET \/api\/v1\/server\/logs$/, path: "/api/v1/server/logs", action: "查询最近日志", key: "server.logs" },
+  { re: /^POST \/api\/v1\/server\/reboot$/, path: "/api/v1/server/reboot", action: "重启服务器", key: "server.reboot" },
   // /server/llm 是页面读取（模型目录 60s 缓存），与 status/metrics 同规则不记；
   // 只有用户主动「切换大模型」才留痕。
-  { re: /^POST \/api\/v1\/server\/llm\/model$/, path: "/api/v1/server/llm/model", action: "切换大模型" },
-  { re: /^POST \/api\/v1\/server\/llm\/provider$/, path: "/api/v1/server/llm/provider", action: "新增大模型" },
-  { re: /^POST \/api\/v1\/server\/llm\/provider\/remove$/, path: "/api/v1/server/llm/provider/remove", action: "删除大模型" },
+  { re: /^POST \/api\/v1\/server\/llm\/model$/, path: "/api/v1/server/llm/model", action: "切换大模型", key: "llm.switchModel" },
+  { re: /^POST \/api\/v1\/server\/llm\/provider$/, path: "/api/v1/server/llm/provider", action: "新增大模型", key: "llm.addProvider" },
+  { re: /^POST \/api\/v1\/server\/llm\/provider\/remove$/, path: "/api/v1/server/llm/provider/remove", action: "删除大模型", key: "llm.removeProvider" },
 
-  // —— MCP（POST /mcp：动作按 JSON-RPC 方法/工具动态识别，见 mcpAction）——
+  // —— MCP（POST /mcp：动作与 key 按 JSON-RPC 方法/工具动态识别，见 mcpAction）——
   { re: /^POST \/mcp$/, path: "/mcp", action: null },
 ];
 
-// MCP 工具名 → 中文（tools/call 时识别）
+// MCP 工具名 → 中文（tools/call 时识别；在此表内的为已知工具，key = mcp.tool.<name>）
 const MCP_TOOL_CN = {
   run_command: "执行命令",
   get_find_file: "查找文件",
@@ -91,6 +95,7 @@ const MCP_TOOL_CN = {
   video_upload: "上传视频",
 };
 
+/** POST /mcp 动态识别：返回 {action（中文原文）, actionKey（稳定 key，未知为 null）} */
 function mcpAction(req) {
   const b = req.body;
   const msg = Array.isArray(b) ? b[0] : b;
@@ -98,23 +103,27 @@ function mcpAction(req) {
   const tool = msg?.params?.name;
   if (method === "tools/call") {
     const cn = MCP_TOOL_CN[tool];
-    return cn ? `调用工具：${cn}` : `调用工具：${tool ?? "未知"}`;
+    // 已知工具带 key；未知工具 key=null（动态文案不配 key，前端回退原文显示）
+    if (cn) return { action: `调用工具：${cn}`, actionKey: `mcp.tool.${tool}` };
+    return { action: `调用工具：${tool ?? "未知"}`, actionKey: null };
   }
-  if (method === "tools/list") return "查询可用工具";
-  if (method === "initialize") return "初始化MCP会话";
-  if (method === "ping") return "MCP心跳";
-  if (method) return `MCP请求（${method}）`;
-  return "MCP请求";
+  if (method === "tools/list") return { action: "查询可用工具", actionKey: "mcp.toolsList" };
+  if (method === "initialize") return { action: "初始化MCP会话", actionKey: "mcp.initialize" };
+  if (method === "ping") return { action: "MCP心跳", actionKey: "mcp.ping" };
+  // 其它 method / 空 method：动态文案，key=null
+  if (method) return { action: `MCP请求（${method}）`, actionKey: null };
+  return { action: "MCP请求", actionKey: null };
 }
 
-/** 识别本次请求的中文动作与路由模式；未匹配返回 null（不记录） */
+/** 识别本次请求的中文动作、稳定 key 与路由模式；未匹配返回 null（不记录） */
 function identify(req) {
   const rawPath = (req.originalUrl || req.url || "").split("?")[0];
   const key = `${req.method} ${rawPath}`;
   for (const rule of ACTION_RULES) {
     if (!rule.re.test(key)) continue;
-    const action = rule.action ?? mcpAction(req);
-    return { action, routePath: rule.path };
+    if (rule.action) return { action: rule.action, actionKey: rule.key ?? null, routePath: rule.path };
+    const dyn = mcpAction(req); // POST /mcp 规则（action=null）：动态识别
+    return { action: dyn.action, actionKey: dyn.actionKey, routePath: rule.path };
   }
   return null;
 }
@@ -184,6 +193,7 @@ export function ensureOperationLog() {
       api_path      TEXT NOT NULL,
       http_method   TEXT NOT NULL,
       action        TEXT NOT NULL,
+      action_key    TEXT,
       content       TEXT NOT NULL,
       params        TEXT,
       result_code   INTEGER NOT NULL,
@@ -201,21 +211,31 @@ export function ensureOperationLog() {
     CREATE INDEX IF NOT EXISTS idx_op_result      ON operation_log (result_code, occurred_at DESC);
   `);
 
+  // 迁移（幂等）：老库建表时没有 action_key 则补列 —— 只加列，不 UPDATE 已有行
+  const hasActionKey = db
+    .prepare("PRAGMA table_info(operation_log)")
+    .all()
+    .some((c) => c.name === "action_key");
+  if (!hasActionKey) {
+    db.exec("ALTER TABLE operation_log ADD COLUMN action_key TEXT");
+  }
+
   // 首次初始化：写入数据库文档 §5 的种子数据（页面日志区有初始内容）
   const count = db.prepare("SELECT COUNT(*) AS n FROM operation_log").get().n;
   if (count === 0) {
+    // 末位 action_key：对应前端语言包 oplog.<key>（server.status/metrics 只存在于种子）
     const rows = [
-      ["req-seed-01", "/api/v1/server/status", "GET", "查看服务器状态", "查看服务器状态成功", "{}", 0, "success", 12, "dev-seed", "192.168.1.56", "2026-09-28 09:41:22"],
-      ["req-seed-02", "/api/v1/server/metrics", "GET", "查看资源使用率", "查看资源使用率成功", "{}", 0, "success", 9, "dev-seed", "192.168.1.56", "2026-09-28 09:41:22"],
-      ["req-seed-03", "/api/v1/server/logs", "GET", "查询最近日志", "查询最近日志成功", '{"limit":5}', 0, "success", 6, "dev-seed", "192.168.1.56", "2026-09-28 09:41:23"],
-      ["req-seed-04", "/api/v1/server/reboot", "POST", "重启服务器", "重启服务器成功", '{"serverId":1,"confirm":true}', 0, "success", 86, "dev-seed", "192.168.1.56", "2026-09-28 09:42:01"],
-      ["req-seed-05", "/api/v1/server/reboot", "POST", "重启服务器", "重启服务器：重启任务已存在，重复触发", '{"serverId":1,"confirm":true}', 2003, "重启任务已存在，重复触发", 4, "dev-seed", "192.168.1.56", "2026-09-28 09:42:05"],
+      ["req-seed-01", "/api/v1/server/status", "GET", "查看服务器状态", "查看服务器状态成功", "{}", 0, "success", 12, "dev-seed", "192.168.1.56", "2026-09-28 09:41:22", "server.status"],
+      ["req-seed-02", "/api/v1/server/metrics", "GET", "查看资源使用率", "查看资源使用率成功", "{}", 0, "success", 9, "dev-seed", "192.168.1.56", "2026-09-28 09:41:22", "server.metrics"],
+      ["req-seed-03", "/api/v1/server/logs", "GET", "查询最近日志", "查询最近日志成功", '{"limit":5}', 0, "success", 6, "dev-seed", "192.168.1.56", "2026-09-28 09:41:23", "server.logs"],
+      ["req-seed-04", "/api/v1/server/reboot", "POST", "重启服务器", "重启服务器成功", '{"serverId":1,"confirm":true}', 0, "success", 86, "dev-seed", "192.168.1.56", "2026-09-28 09:42:01", "server.reboot"],
+      ["req-seed-05", "/api/v1/server/reboot", "POST", "重启服务器", "重启服务器：重启任务已存在，重复触发", '{"serverId":1,"confirm":true}', 2003, "重启任务已存在，重复触发", 4, "dev-seed", "192.168.1.56", "2026-09-28 09:42:05", "server.reboot"],
     ];
     const stmt = db.prepare(`
       INSERT INTO operation_log
         (request_id, server_id, api_path, http_method, action, content, params,
-         result_code, result_msg, duration_ms, device_id, client_ip, occurred_at)
-      VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         result_code, result_msg, duration_ms, device_id, client_ip, occurred_at, action_key)
+      VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const r of rows) stmt.run(...r);
   }
@@ -238,15 +258,16 @@ function recordOperation(req, res, payload, durationMs) {
 
       db.prepare(`
         INSERT INTO operation_log
-          (request_id, server_id, api_path, http_method, action, content, params,
+          (request_id, server_id, api_path, http_method, action, action_key, content, params,
            result_code, result_msg, duration_ms, operator, device_id, client_ip)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         req.headers["x-request-id"] || null,
         SERVER_ID,
         ided.routePath,
         req.method,
         ided.action,
+        ided.actionKey ?? null,
         content,
         sanitizeParams(req),
         docResultCode(payload, res.statusCode),

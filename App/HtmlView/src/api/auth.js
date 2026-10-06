@@ -1,4 +1,6 @@
 // 登录认证 API — 对接 McpServer/LoginApi.js（/api/v1/auth，见《登录接口文档-v2.md》）
+import { t } from '../i18n/index.js'
+
 export const API_BASE =
   import.meta.env.VITE_API_BASE ||
   `http://${window.location.hostname || 'localhost'}:3000/api/v1`
@@ -59,7 +61,7 @@ export async function request(path, { method = 'GET', body, token } = {}) {
       body: body ? JSON.stringify(body) : undefined,
     })
   } catch {
-    const err = new Error('无法连接服务器，请确认后端已启动')
+    const err = new Error(t('error.NETWORK_ERROR'))
     err.type = 'NETWORK_ERROR'
     err.code = 0
     throw err
@@ -67,7 +69,7 @@ export async function request(path, { method = 'GET', body, token } = {}) {
 
   const data = await res.json().catch(() => null)
   if (!res.ok || (data && data.code >= 400)) {
-    const err = new Error(data?.message || `请求失败（HTTP ${res.status}）`)
+    const err = new Error(data?.message || t('error.HTTP', { code: res.status }))
     err.code = data?.code ?? res.status
     err.type = data?.error?.type
     throw err
@@ -106,8 +108,8 @@ export async function tryRefresh() {
 export async function fetchMe() {
   const token = getToken()
   if (!token) {
-    const err = new Error('未登录')
-    err.type = 'MISSING_TOKEN'
+    const err = new Error(t('error.NOT_LOGGED_IN'))
+    err.type = 'NOT_LOGGED_IN'
     throw err
   }
   try {
@@ -141,8 +143,8 @@ export async function changePassword(currentPassword, newPassword, confirmPasswo
   const call = (token) => request('/auth/change-password', { method: 'POST', body, token })
   const token = getToken()
   if (!token) {
-    const err = new Error('未登录')
-    err.type = 'MISSING_TOKEN'
+    const err = new Error(t('error.NOT_LOGGED_IN'))
+    err.type = 'NOT_LOGGED_IN'
     throw err
   }
   try {

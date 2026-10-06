@@ -1,5 +1,6 @@
 // 任务管理 API — 对接 McpServer/TaskApi.js（/api/v1/tasks，见《任务管理接口文档-v2.md》）
 import { request, tryRefresh, getToken, API_BASE } from './auth.js'
+import { t } from '../i18n/index.js'
 
 const WS_HOST = import.meta.env.VITE_API_WS || `${window.location.hostname || 'localhost'}:3000`
 
@@ -105,14 +106,14 @@ export function uploadFiles(files, onProgress) {
       if (xhr.status >= 200 && xhr.status < 300 && data && data.code < 400) {
         resolve(data.data)
       } else {
-        const err = new Error(data?.message || `上传失败（HTTP ${xhr.status}）`)
+        const err = new Error(data?.message || t('error.UPLOAD_HTTP', { code: xhr.status }))
         err.type = data?.error?.type
         err.code = data?.code ?? xhr.status
         reject(err)
       }
     }
     xhr.onerror = () => {
-      const err = new Error('网络异常，上传失败')
+      const err = new Error(t('error.NETWORK_UPLOAD'))
       err.type = 'NETWORK_ERROR'
       reject(err)
     }

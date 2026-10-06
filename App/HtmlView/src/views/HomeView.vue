@@ -8,6 +8,8 @@ import {
 import { MD_RE, renderMarkdown } from '../lib/markdown.js'
 import { push } from '../router.js'
 import { getLlmInfo } from '../api/system.js'
+import { t, errText, locale } from '../i18n/index.js'
+import { fmtNum } from '../i18n/date.js'
 
 // 依据 随身互联开发文档/设计/随身互联App四Tab原型(6).html 首页（Tab1 任务中心）实现
 // 数据接 /api/v1/tasks，WS 实时刷新 + since 重放（断联中继）；除首页外的 Tab 仅保留视觉
@@ -18,7 +20,21 @@ const loading = ref(false)
 
 // 统计卡选中筛选：null = 全部，选中后列表只看该状态（再点一次取消）
 const statFilter = ref(null)
-const filterLabels = { running: '执行中', queued: '排队中', completed: '已完成', failed: '失败' }
+// 状态字典收口：筛选标签（无标记版）与详情/卡片状态标记（✓✕ 版）统一在 computed 里取 state.* key，
+// 随 locale 切换自动重算（completed 两侧文案不同：筛选『已完成』/ 详情『✓ 已完成』，勿混用）
+const filterLabels = computed(() => ({
+  running: t('state.running'),
+  queued: t('state.queued'),
+  completed: t('state.completed'),
+  failed: t('state.failed'),
+}))
+const stateMarked = computed(() => ({
+  running: t('state.running'),
+  queued: t('state.queued'),
+  completed: t('state.doneMarked'),
+  failed: t('state.failedMarked'),
+  cancelled: t('state.cancelledMarked'),
+}))
 function toggleFilter(state) {
   statFilter.value = statFilter.value === state ? null : state
 }
@@ -118,7 +134,7 @@ async function openUsage(t) {
   try {
     usageData.value = await getTaskUsage(t.task_id)
   } catch (e) {
-    usageErr.value = e?.message || '调用统计加载失败'
+    usageErr.value = errText(e, 'home.toast.usageLoadFailed')
   } finally {
     usageLoading.value = false
   }
@@ -148,18 +164,18 @@ async function refreshUsage() {
   }
 }
 
-// 任务卡图标的模型缩写与悬浮提示
+// 任务卡图标的模型缩写与悬浮提示（参数名 task，避免遮蔽 i18n 的 t）
 function abbrOf(t) {
   return t?.model_abbr || t?.model?.abbr || 'LLM'
 }
-function modelTitle(t) {
-  const m = t?.model
-  const full = m ? `${m.provider_id ? m.provider_id + '/' : ''}${m.model_id}` : '尚未调用大模型'
-  return `当前会话调用大模型：${full}（点击查看调用统计）`
+function modelTitle(task) {
+  const m = task?.model
+  const full = m ? `${m.provider_id ? m.provider_id + '/' : ''}${m.model_id}` : t('home.model.neverCalled')
+  return t('home.model.usageTooltip', { full })
 }
 
 function fmtTok(n) {
-  return (n || 0).toLocaleString('en-US')
+  return fmtNum(n)
 }
 function fmtCost(c) {
   return c > 0 ? `$${c.toFixed(4)}` : '—'
@@ -203,18 +219,18 @@ async function checkLlmReady() {
     const d = await getLlmInfo()
     const active = d?.current?.active || ''
     if (!active) {
-      llmNoticeReason.value = '尚未配置大模型（当前模型为空），配置后才可以使用任务功能。'
+      llmNoticeReason.value = t('home.llmNotice.empty')
       llmNoticeOpen.value = true
       return
     }
     const m = (d?.models || []).find((x) => x.key === active)
     if (!m) {
-      llmNoticeReason.value = `当前大模型 ${active} 不可用：未在模型目录中注册，请重新配置大模型后再使用任务功能。`
+      llmNoticeReason.value = t('home.llmNotice.notRegistered', { active })
       llmNoticeOpen.value = true
       return
     }
     if (m.status !== 'active') {
-      llmNoticeReason.value = `当前大模型 ${active} 不可用（目录状态：${m.status || '未知'}），请重新配置大模型后再使用任务功能。`
+      llmNoticeReason.value = t('home.llmNotice.badStatus', { active, status: m.status || t('common.unknown') })
       llmNoticeOpen.value = true
     }
   } catch {
@@ -237,7 +253,7 @@ async function load() {
     tasks.value = data.tasks
     setEventSeq(data.server_seq) // 快照水位：WS 重连从这里补发，不多不少
   } catch (e) {
-    toast(e?.message || '任务列表加载失败')
+    toast(errText(e, 'home.toast.loadFailed'))
   } finally {
     loading.value = false
   }
@@ -264,9 +280,9 @@ function startText(t) {
   return t.started_at ? t.started_at.slice(11, 16) : '—'
 }
 
-function durText(t) {
-  if (t.state === 'queued') return '排队中'
-  const s = t.duration_sec ?? 0
+function durText(task) {
+  if (task.state === 'queued') return t('state.queued')
+  const s = task.duration_sec ?? 0
   return `${p2(Math.floor(s / 60))}:${p2(s % 60)}`
 }
 
@@ -275,42 +291,42 @@ function createdText(t) {
 }
 
 /** 卡片副行：创建时间（必有）+ 开始时间（跑过才有）+ 耗时/排队状态 */
-function subText(t) {
-  const parts = [`${createdText(t)} 创建`]
-  if (t.started_at) parts.push(`开始 ${startText(t)}`)
-  parts.push(`耗时 ${durText(t)}`)
+function subText(task) {
+  const parts = [t('home.fmt.created', { time: createdText(task) })]
+  if (task.started_at) parts.push(t('home.fmt.started', { time: startText(task) }))
+  parts.push(t('home.fmt.duration', { time: durText(task) }))
   return parts.join(' · ')
 }
 
 // ---------- 操作 ----------
-async function onCancel(t) {
+async function onCancel(task) {
   try {
-    await cancelTask(t.task_id)
-    toast('任务已取消')
+    await cancelTask(task.task_id)
+    toast(t('home.toast.cancelled'))
     await load()
   } catch (e) {
-    toast(e?.message || '取消失败')
+    toast(errText(e, 'home.toast.cancelFailed'))
   }
 }
 
-async function onDelete(t) {
+async function onDelete(task) {
   try {
-    await deleteTask(t.task_id)
-    toast('任务已删除')
+    await deleteTask(task.task_id)
+    toast(t('home.toast.deleted'))
     await load()
   } catch (e) {
-    toast(e?.message || '删除失败')
+    toast(errText(e, 'home.toast.deleteFailed'))
   }
 }
 
-async function onRetry(t) {
+async function onRetry(task) {
   try {
-    const d = await getTask(t.task_id) // 列表不含 message，重试需取详情
+    const d = await getTask(task.task_id) // 列表不含 message，重试需取详情
     await createTask({ name: d.name, icon: d.icon || '📌', message: d.message || d.name })
-    toast('已重试任务')
+    toast(t('home.toast.retried'))
     await load()
   } catch (e) {
-    toast(e?.message || '重试失败')
+    toast(errText(e, 'home.toast.retryFailed'))
   }
 }
 
@@ -324,18 +340,18 @@ async function submitNew() {
   if (creating.value) return
   const name = newName.value.trim()
   const message = newMessage.value.trim()
-  if (!name) return toast('请输入任务名称')
-  if (!message) return toast('请输入任务指令')
+  if (!name) return toast(t('home.toast.needTaskName'))
+  if (!message) return toast(t('home.toast.needInstruction'))
   creating.value = true
   try {
     const batch = await uploadBatchFor(newFiles) // 有参考物先上传（按钮显示进度）
     await createTask({ name, icon: '📌', message, upload_batch: batch })
     newFiles.value = []
     newOpen.value = false
-    toast('任务已创建，MiMoCode 开始执行')
+    toast(t('home.toast.created'))
     await load()
   } catch (e) {
-    toast(e?.message || '创建失败')
+    toast(errText(e, 'home.toast.createFailed'))
   } finally {
     creating.value = false
     upPct.value = null
@@ -361,7 +377,7 @@ async function openDetail(t) {
     detailArtifacts.value = a.artifacts
     scrollMsgs()
   } catch (e) {
-    toast(e?.message || '详情加载失败')
+    toast(errText(e, 'home.toast.detailLoadFailed'))
     detailOpen.value = false
   } finally {
     detailLoading.value = false
@@ -401,7 +417,7 @@ function scrollMsgs() {
 async function onSend() {
   if (sending.value || !detailTask.value) return
   const content = sendText.value.trim()
-  if (!content) return toast('请输入指令内容（参考物需配合指令发送）')
+  if (!content) return toast(t('home.toast.needMessage'))
   sending.value = true
   try {
     const batch = await uploadBatchFor(sendFiles)
@@ -418,10 +434,10 @@ async function onSend() {
       created_at: r.created_at,
     })
     if (r.state) detailTask.value.state = r.state
-    toast(r.pending ? '已排队，当前轮结束后自动执行' : '已发送')
+    toast(r.pending ? t('home.toast.queued') : t('home.toast.sent'))
     scrollMsgs()
   } catch (e) {
-    toast(e?.message || '发送失败')
+    toast(errText(e, 'home.toast.sendFailed'))
   } finally {
     sending.value = false
     upPct.value = null
@@ -457,7 +473,7 @@ async function loadMd(a) {
   mdError.value = ''
   try {
     const res = await fetch(artifactUrl(detailTask.value.task_id, id, { inline: true }))
-    if (!res.ok) throw new Error(`加载失败（HTTP ${res.status}）`)
+    if (!res.ok) throw new Error(t('home.md.loadHttpFailed', { code: res.status }))
     const text = await res.text()
     if (previewArt.value?.artifact_id !== id) return // 已切到别的文件/已关闭
     mdRaw.value = text
@@ -469,7 +485,7 @@ async function loadMd(a) {
     })
   } catch (e) {
     if (previewArt.value?.artifact_id !== id) return
-    mdError.value = e?.message || 'Markdown 加载失败'
+    mdError.value = errText(e, 'home.toast.markdownLoadFailed')
     mdRaw.value = ''
     mdHtml.value = ''
   } finally {
@@ -504,8 +520,8 @@ async function onMdClick(e) {
     document.execCommand('copy')
     ta.remove()
   }
-  btn.textContent = '已复制'
-  setTimeout(() => (btn.textContent = '复制'), 1500)
+  btn.textContent = t('common.copied')
+  setTimeout(() => (btn.textContent = t('common.copy')), 1500)
 }
 
 // 切换预览文件时重新加载 Markdown，并复位视图模式
@@ -533,11 +549,11 @@ function pickFilesInto(e, listRef) {
   e.target.value = '' // 清掉以便再次选同一文件仍触发 change
   for (const f of chosen) {
     if (listRef.value.length >= MAX_FILES) {
-      toast(`单次最多 ${MAX_FILES} 个参考物`)
+      toast(t('home.toast.maxFiles', { n: MAX_FILES }))
       break
     }
     if (f.size > MAX_FILE_BYTES) {
-      toast(`「${f.name}」超过 50MB，已跳过`)
+      toast(t('home.toast.fileTooLarge', { name: f.name }))
       continue
     }
     if (listRef.value.some((x) => x.name === f.name && x.size === f.size)) continue
@@ -566,10 +582,10 @@ async function openAtt(a) {
   try {
     const { artifacts } = await getArtifacts(detailTask.value.task_id)
     const hit = artifacts.find((x) => x.filename === a.filename)
-    if (!hit) return toast('文件已不存在')
+    if (!hit) return toast(t('home.toast.fileGone'))
     openPreview(hit)
   } catch (e) {
-    toast(e?.message || '打开失败')
+    toast(errText(e, 'home.toast.openFailed'))
   }
 }
 
@@ -636,92 +652,93 @@ onUnmounted(() => {
   <div class="page">
     <!-- 内容区 -->
     <div class="content">
-      <div class="sect-title"><span class="bar" style="background: var(--purple)"></span>任务中心</div>
+      <div class="sect-title"><span class="bar" style="background: var(--purple)"></span>{{ t('home.title') }}</div>
 
       <!-- 统计：点击选中筛选对应状态，再点取消 -->
       <div class="stats">
         <div class="stat" :class="{ on: statFilter === 'running' }" @click="toggleFilter('running')">
           <div class="n" style="color: var(--blue)">{{ stats.running }}</div>
-          <div class="l">执行中</div>
+          <div class="l">{{ t('home.stat.running') }}</div>
         </div>
         <div class="stat" :class="{ on: statFilter === 'queued' }" @click="toggleFilter('queued')">
           <div class="n" style="color: var(--t2)">{{ stats.queued }}</div>
-          <div class="l">排队中</div>
+          <div class="l">{{ t('home.stat.queued') }}</div>
         </div>
         <div class="stat" :class="{ on: statFilter === 'completed' }" @click="toggleFilter('completed')">
           <div class="n" style="color: var(--green)">{{ stats.completed }}</div>
-          <div class="l">今日完成</div>
+          <div class="l">{{ t('home.stat.completed') }}</div>
         </div>
         <div class="stat" :class="{ on: statFilter === 'failed' }" @click="toggleFilter('failed')">
           <div class="n" style="color: var(--red)">{{ stats.failed }}</div>
-          <div class="l">失败</div>
+          <div class="l">{{ t('home.stat.failed') }}</div>
         </div>
       </div>
 
       <!-- 任务列表（点卡片任意区域弹出详情；操作区/模型图标各自拦截冒泡） -->
+      <!-- v-for 别名用 task 而非 t：t 是 i18n 的 t()，在循环作用域内会被遮蔽 -->
       <div id="taskList">
         <div
-          v-for="t in visibleTasks"
-          :id="'task' + t.task_id"
-          :key="t.task_id"
+          v-for="task in visibleTasks"
+          :id="'task' + task.task_id"
+          :key="task.task_id"
           class="card"
-          @click="openDetail(t)"
+          @click="openDetail(task)"
         >
           <div class="task-head">
             <!-- 左侧图标 = 当前会话调用大模型的缩写，点击弹出调用统计信息框 -->
             <button
               type="button"
               class="task-ic task-ic--model"
-              :title="modelTitle(t)"
-              @click.stop="openUsage(t)"
-            >{{ abbrOf(t) }}</button>
+              :title="modelTitle(task)"
+              @click.stop="openUsage(task)"
+            >{{ abbrOf(task) }}</button>
             <div class="task-main">
-              <div class="task-name">{{ t.name }}</div>
-              <div class="task-sub">{{ subText(t) }}</div>
+              <div class="task-name">{{ task.name }}</div>
+              <div class="task-sub">{{ subText(task) }}</div>
             </div>
             <div class="task-st">
-              <span v-if="t.state === 'running'" class="st blue"
-                ><span class="dot pulse" style="background: var(--blue)"></span>执行中</span
+              <span v-if="task.state === 'running'" class="st blue"
+                ><span class="dot pulse" style="background: var(--blue)"></span>{{ t('state.running') }}</span
               >
-              <span v-else-if="t.state === 'queued'" class="st gray"
-                ><span class="dot"></span>排队中 #{{ queuePos[t.task_id] }}</span
+              <span v-else-if="task.state === 'queued'" class="st gray"
+                ><span class="dot"></span>{{ t('state.queued') }} #{{ queuePos[task.task_id] }}</span
               >
-              <span v-else-if="t.state === 'completed'" class="st green">✓ 已完成</span>
-              <span v-else-if="t.state === 'failed'" class="st red">✕ 失败</span>
-              <span v-else class="st red">✕ 已取消</span>
+              <span v-else-if="task.state === 'completed'" class="st green">{{ t('state.doneMarked') }}</span>
+              <span v-else-if="task.state === 'failed'" class="st red">{{ t('state.failedMarked') }}</span>
+              <span v-else class="st red">{{ t('state.cancelledMarked') }}</span>
             </div>
           </div>
 
           <!-- .stop：按钮各自处理点击，不再冒泡到卡片（避免打开详情叠加触发） -->
           <div class="task-ops" @click.stop>
             <!-- 左下角：当前轮对话（列表接口的 current_round，新消息经 WS 重拉自动刷新） -->
-            <div v-if="t.current_round" class="task-round" :title="t.current_round.content">
-              <span class="round-tag" :class="{ pend: t.current_round.pending }">
-                {{ t.current_round.role === 'user' ? '我' : '助手'
-                }}{{ t.current_round.pending ? ' · 排队' : '' }}</span
+            <div v-if="task.current_round" class="task-round" :title="task.current_round.content">
+              <span class="round-tag" :class="{ pend: task.current_round.pending }">
+                {{ task.current_round.role === 'user' ? t('home.msg.me') : t('home.msg.assistant')
+                }}{{ task.current_round.pending ? t('home.round.pending') : '' }}</span
               >
-              <span class="round-text">{{ t.current_round.content }}</span>
+              <span class="round-text">{{ task.current_round.content }}</span>
             </div>
-            <template v-if="t.state === 'running'">
-              <button class="btn sm line" @click="openDetail(t)">查看详情</button>
-              <button class="btn sm red" @click="onCancel(t)">取消</button>
+            <template v-if="task.state === 'running'">
+              <button class="btn sm line" @click="openDetail(task)">{{ t('home.action.viewDetail') }}</button>
+              <button class="btn sm red" @click="onCancel(task)">{{ t('common.cancel') }}</button>
             </template>
-            <template v-else-if="t.state === 'queued'">
-              <button class="btn sm line" @click="openDetail(t)">查看详情</button>
-              <button class="btn sm red" @click="onCancel(t)">取消</button>
+            <template v-else-if="task.state === 'queued'">
+              <button class="btn sm line" @click="openDetail(task)">{{ t('home.action.viewDetail') }}</button>
+              <button class="btn sm red" @click="onCancel(task)">{{ t('common.cancel') }}</button>
             </template>
-            <template v-else-if="t.state === 'failed'">
-              <button class="btn sm line" @click="openDetail(t)">查看详情</button>
-              <button class="btn sm green" @click="onRetry(t)">重试</button>
-              <button class="btn sm red" @click="onDelete(t)">删除</button>
+            <template v-else-if="task.state === 'failed'">
+              <button class="btn sm line" @click="openDetail(task)">{{ t('home.action.viewDetail') }}</button>
+              <button class="btn sm green" @click="onRetry(task)">{{ t('common.retry') }}</button>
+              <button class="btn sm red" @click="onDelete(task)">{{ t('common.delete') }}</button>
             </template>
-            <template v-else-if="t.state === 'completed'">
-              <button class="btn sm line" @click="openDetail(t)">查看详情</button>
-              <button class="btn sm red" @click="onDelete(t)">删除</button>
+            <template v-else-if="task.state === 'completed'">
+              <button class="btn sm line" @click="openDetail(task)">{{ t('home.action.viewDetail') }}</button>
+              <button class="btn sm red" @click="onDelete(task)">{{ t('common.delete') }}</button>
             </template>
             <template v-else>
-              <button class="btn sm line" @click="openDetail(t)">查看详情</button>
-              <button class="btn sm red" @click="onDelete(t)">删除</button>
+              <button class="btn sm line" @click="openDetail(task)">{{ t('home.action.viewDetail') }}</button>
+              <button class="btn sm red" @click="onDelete(task)">{{ t('common.delete') }}</button>
             </template>
           </div>
         </div>
@@ -729,17 +746,17 @@ onUnmounted(() => {
         <div v-if="!visibleTasks.length" class="center muted" style="padding: 30px 0">
           {{
             loading
-              ? '加载中…'
+              ? t('common.loading')
               : statFilter
-                ? `暂无${filterLabels[statFilter]}任务`
-                : '暂无任务，点击下方新建任务'
+                ? t('home.emptyFiltered', { label: filterLabels[statFilter] })
+                : t('home.empty')
           }}
         </div>
       </div>
     </div>
 
     <!-- 新建任务：右下角圆形浮窗 -->
-    <button class="fab" aria-label="新建任务" title="新建任务" @click="openNew">
+    <button class="fab" :aria-label="t('home.action.newTask')" :title="t('home.action.newTask')" @click="openNew">
       <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
     </button>
 
@@ -747,15 +764,15 @@ onUnmounted(() => {
     <div class="tabbar">
       <div class="tab on">
         <svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-        <span>首页</span>
+        <span>{{ t('common.tab.home') }}</span>
       </div>
       <div class="tab" @click="push('/blank')">
         <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
-        <span>空白</span>
+        <span>{{ t('common.tab.blank') }}</span>
       </div>
       <div class="tab" @click="push('/service')">
         <svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-        <span>我的</span>
+        <span>{{ t('common.tab.me') }}</span>
       </div>
     </div>
 
@@ -765,11 +782,11 @@ onUnmounted(() => {
     <!-- 大模型就绪提醒：进入任务列表时，当前模型为空或不可用则弹出，主按钮直达「新增大模型」弹窗 -->
     <div class="overlay" :class="{ show: llmNoticeOpen }" @click.self="llmNoticeOpen = false">
       <div class="sheet sheet--llm-notice">
-        <h3>需要配置大模型</h3>
+        <h3>{{ t('home.llmNotice.title') }}</h3>
         <p class="llm-notice-txt">{{ llmNoticeReason }}</p>
         <div style="display: flex; gap: 10px; margin-top: 16px">
-          <button class="btn line" style="flex: 1; justify-content: center" @click="llmNoticeOpen = false">稍后再说</button>
-          <button class="btn primary" style="flex: 1; justify-content: center" @click="goAddLlm">去配置大模型</button>
+          <button class="btn line" style="flex: 1; justify-content: center" @click="llmNoticeOpen = false">{{ t('home.llmNotice.later') }}</button>
+          <button class="btn primary" style="flex: 1; justify-content: center" @click="goAddLlm">{{ t('home.llmNotice.configure') }}</button>
         </div>
       </div>
     </div>
@@ -777,20 +794,20 @@ onUnmounted(() => {
     <!-- 新建任务弹窗 -->
     <div class="overlay" :class="{ show: newOpen }" @click.self="newOpen = false">
       <div class="sheet">
-        <h3>新建任务</h3>
-        <input v-model="newName" class="input" placeholder="输入任务名称…" style="margin-bottom: 14px" />
+        <h3>{{ t('home.action.newTask') }}</h3>
+        <input v-model="newName" class="input" :placeholder="t('home.input.taskName')" style="margin-bottom: 14px" />
         <textarea
           v-model="newMessage"
           class="input ta"
-          placeholder="输入发送给 MiMoCode 的指令…"
+          :placeholder="t('home.input.instruction')"
           rows="3"
           style="margin-bottom: 14px"
         ></textarea>
 
         <!-- 参考物（分步上传） -->
         <div class="attach-row">
-          <button class="btn sm line" type="button" @click="newFileEl?.click()">📎 添加参考物</button>
-          <span class="muted">最多 {{ MAX_FILES }} 个 · 单个 ≤50MB</span>
+          <button class="btn sm line" type="button" @click="newFileEl?.click()">📎 {{ t('home.action.addFiles') }}</button>
+          <span class="muted">{{ t('home.attach.limit', { n: MAX_FILES }) }}</span>
         </div>
         <div v-if="newFiles.length" class="file-chips">
           <span v-for="(f, i) in newFiles" :key="f.name + i" class="chip">
@@ -807,9 +824,9 @@ onUnmounted(() => {
         />
 
         <div style="display: flex; gap: 10px; margin-top: 14px">
-          <button class="btn line" style="flex: 1; justify-content: center" @click="newOpen = false">取消</button>
+          <button class="btn line" style="flex: 1; justify-content: center" @click="newOpen = false">{{ t('common.cancel') }}</button>
           <button class="btn primary" style="flex: 1; justify-content: center" :disabled="creating" @click="submitNew">
-            {{ creating ? (upPct != null ? `上传中 ${upPct}%` : '创建中…') : '确认' }}
+            {{ creating ? (upPct != null ? t('home.upload.progress', { p: upPct }) : t('home.creating')) : t('common.confirm') }}
           </button>
         </div>
       </div>
@@ -819,12 +836,12 @@ onUnmounted(() => {
     <div class="overlay" :class="{ show: detailOpen }" @click.self="detailOpen = false">
       <div class="sheet sheet--detail">
         <div class="sheet-head">
-          <h3>任务详情</h3>
-          <button class="close-x" aria-label="关闭" title="关闭" @click="detailOpen = false">
+          <h3>{{ t('home.detail.title') }}</h3>
+          <button class="close-x" :aria-label="t('common.close')" :title="t('common.close')" @click="detailOpen = false">
             <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
-        <div v-if="detailLoading" class="center muted" style="padding: 20px 0">加载中…</div>
+        <div v-if="detailLoading" class="center muted" style="padding: 20px 0">{{ t('common.loading') }}</div>
         <template v-else-if="detailTask">
           <div class="sheet-scroll">
             <div class="detail-head">
@@ -836,50 +853,50 @@ onUnmounted(() => {
               >{{ abbrOf(detailTask) }}</button>
               <div style="flex: 1; min-width: 0">
                 <div class="task-name">{{ detailTask.name }}</div>
-                <div class="task-sub">{{ startText(detailTask) }} · 耗时 {{ durText(detailTask) }}</div>
+                <div class="task-sub">{{ startText(detailTask) }} · {{ t('home.fmt.duration', { time: durText(detailTask) }) }}</div>
               </div>
               <span
                 class="st"
                 :class="{ blue: detailTask.state === 'running', gray: detailTask.state === 'queued', green: detailTask.state === 'completed', red: detailTask.state === 'failed' || detailTask.state === 'cancelled' }"
               >
-                {{ { running: '执行中', queued: '排队中', completed: '✓ 已完成', failed: '✕ 失败', cancelled: '✕ 已取消' }[detailTask.state] }}
+                {{ stateMarked[detailTask.state] }}
               </span>
             </div>
-            <div class="kv"><span class="k">任务 ID</span><span class="v">{{ detailTask.task_id }}</span></div>
-            <div class="kv"><span class="k">会话 ID</span><span class="v mono">{{ detailTask.session_id || '—' }}</span></div>
+            <div class="kv"><span class="k">{{ t('home.detail.taskId') }}</span><span class="v">{{ detailTask.task_id }}</span></div>
+            <div class="kv"><span class="k">{{ t('home.detail.sessionId') }}</span><span class="v mono">{{ detailTask.session_id || '—' }}</span></div>
             <div v-if="detailTask.error_message" class="kv">
-              <span class="k">错误信息</span><span class="v" style="color: var(--red)">{{ detailTask.error_message }}</span>
+              <span class="k">{{ t('home.detail.errorMessage') }}</span><span class="v" style="color: var(--red)">{{ detailTask.error_message }}</span>
             </div>
-            <div class="kv"><span class="k">当前指令</span><span class="v" style="max-width: 65%; text-align: right">{{ currentInstruction }}</span></div>
+            <div class="kv"><span class="k">{{ t('home.detail.currentCommand') }}</span><span class="v" style="max-width: 65%; text-align: right">{{ currentInstruction }}</span></div>
             <!-- 执行中：会话检查点全文，从最后一行往上显示（限高两行，每秒拉最新内容） -->
             <div v-if="detailTask.state === 'running'" class="kv kv--ckpt">
-              <span class="k">检查点</span>
-              <span class="v ckpt-box" :title="ckptReversed || '暂无检查点内容'">
-                {{ ckptReversed || '暂无检查点内容（写入后每秒自动刷新）' }}
+              <span class="k">{{ t('home.checkpoint.label') }}</span>
+              <span class="v ckpt-box" :title="ckptReversed || t('home.checkpoint.empty')">
+                {{ ckptReversed || t('home.checkpoint.emptyRefreshing') }}
               </span>
             </div>
 
-            <div class="detail-sub">消息记录</div>
-            <div v-if="!detailMsgs.length" class="center muted" style="padding: 10px 0">暂无消息</div>
+            <div class="detail-sub">{{ t('home.detail.messages') }}</div>
+            <div v-if="!detailMsgs.length" class="center muted" style="padding: 10px 0">{{ t('home.msg.empty') }}</div>
             <div v-else ref="msgsBox" class="msgs">
               <div
                 v-for="m in detailMsgs"
                 :key="m.msg_id"
                 class="msg-row"
                 :class="m.role"
-                :title="'点击查看完整内容'"
+                :title="t('home.checkpoint.viewFull')"
                 @click="fullMsg = m"
               >
-                <span class="msg-role">{{ m.role === 'user' ? '我' : 'MiMoCode' }}</span>
+                <span class="msg-role">{{ m.role === 'user' ? t('home.msg.me') : 'MiMoCode' }}</span>
                 <span class="msg-content">{{ m.content }}</span>
-                <span v-if="m.pending" class="st gray pending-tag">排队中</span>
+                <span v-if="m.pending" class="st gray pending-tag">{{ t('home.msg.queuedTag') }}</span>
                 <div v-if="m.attachments?.length" class="msg-atts">
                   <button
                     v-for="a in m.attachments"
                     :key="a.filename"
                     class="att-chip"
                     type="button"
-                    :title="'点击查看：' + a.filename"
+                    :title="t('home.msg.viewAttachment', { name: a.filename })"
                     @click.stop="openAtt(a)"
                   >
                     📎 {{ a.filename }}<span>{{ fmtSize(a.size) }}</span>
@@ -887,16 +904,16 @@ onUnmounted(() => {
                 </div>
               </div>
               <div v-if="detailTask.state === 'running'" class="muted" style="padding: 8px 0 0 76px">
-                MiMoCode 执行中，回复会在完成后出现…
+                {{ t('home.model.checkpointRunning') }}
               </div>
             </div>
 
             <!-- 产物：列表 + 在线预览 / 下载 -->
             <div class="detail-sub">
-              产物 <span v-if="detailArtifacts.length" class="muted">({{ detailArtifacts.length }})</span>
+              {{ t('home.artifacts.title') }} <span v-if="detailArtifacts.length" class="muted">({{ detailArtifacts.length }})</span>
             </div>
             <div v-if="!detailArtifacts.length" class="center muted" style="padding: 6px 0">
-              暂无产物文件
+              {{ t('home.artifacts.empty') }}
             </div>
             <div v-for="a in detailArtifacts" :key="a.artifact_id" class="art-row">
               <span class="art-name" :title="a.rel_path">{{ a.filename }}</span>
@@ -905,12 +922,12 @@ onUnmounted(() => {
                 v-if="isPreviewable(a.filename)"
                 class="btn sm line"
                 @click="openPreview(a)"
-              >预览</button>
+              >{{ t('home.action.preview') }}</button>
               <a
                 class="btn sm green"
                 :href="artifactUrl(detailTask.task_id, a.artifact_id)"
                 :download="a.filename"
-              >下载</a>
+              >{{ t('home.action.download') }}</a>
             </div>
           </div>
 
@@ -920,7 +937,7 @@ onUnmounted(() => {
               <input
                 v-model="sendText"
                 class="input"
-                placeholder="发送新消息（执行中将排队等待）"
+                :placeholder="t('home.input.newMessage')"
                 :disabled="sending"
                 @keydown.enter.prevent="onSend"
               />
@@ -929,14 +946,14 @@ onUnmounted(() => {
                 :disabled="sending || !sendText.trim()"
                 @click="onSend"
               >
-                {{ sending ? (upPct != null ? `${upPct}%` : '…') : '发送' }}
+                {{ sending ? (upPct != null ? `${upPct}%` : '…') : t('home.action.send') }}
               </button>
             </div>
             <div class="attach-row">
               <button class="btn sm line" type="button" :disabled="sending" @click="sendFileEl?.click()">
-                📎 添加参考物
+                📎 {{ t('home.action.addFiles') }}
               </button>
-              <span class="muted">最多 {{ MAX_FILES }} 个 · 单个 ≤50MB</span>
+              <span class="muted">{{ t('home.attach.limit', { n: MAX_FILES }) }}</span>
             </div>
             <div v-if="sendFiles.length" class="file-chips">
               <span v-for="(f, i) in sendFiles" :key="f.name + i" class="chip">
@@ -961,12 +978,12 @@ onUnmounted(() => {
     <div class="overlay usage-overlay" :class="{ show: usageOpen }" @click.self="closeUsage">
       <div class="sheet sheet--usage">
         <div class="sheet-head">
-          <h3>调用统计</h3>
-          <button class="close-x" aria-label="关闭" title="关闭" @click="closeUsage">
+          <h3>{{ t('home.usage.title') }}</h3>
+          <button class="close-x" :aria-label="t('common.close')" :title="t('common.close')" @click="closeUsage">
             <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
-        <div v-if="usageLoading" class="center muted" style="padding: 20px 0">加载中…</div>
+        <div v-if="usageLoading" class="center muted" style="padding: 20px 0">{{ t('common.loading') }}</div>
         <div v-else-if="usageErr" class="usage-err">{{ usageErr }}</div>
         <template v-else-if="usageData">
           <!-- 当前会话调用的大模型 -->
@@ -977,57 +994,59 @@ onUnmounted(() => {
                 {{
                   usageData.model
                     ? `${usageData.model.provider_id ? usageData.model.provider_id + '/' : ''}${usageData.model.model_id}`
-                    : '尚未调用大模型'
+                    : t('home.model.neverCalled')
                 }}
               </div>
-              <div class="muted">当前会话调用大模型 · {{ usageData.session_id || '会话未创建' }}</div>
+              <div class="muted">{{ t('home.usage.currentModel') }} · {{ usageData.session_id || t('home.usage.sessionNone') }}</div>
             </div>
           </div>
 
           <!-- 汇总 -->
           <div class="usage-grid">
-            <div class="ug"><b>{{ usageData.totals.rounds }}</b><span>轮对话</span></div>
-            <div class="ug"><b>{{ usageData.totals.calls }}</b><span>模型调用</span></div>
-            <div class="ug"><b>{{ fmtTok(usageData.totals.tokens.total) }}</b><span>总 Token</span></div>
-            <div class="ug" title="当前会话上下文大小（1 KB = 1024 token）"><b>{{ fmtCtx(usageData.totals.context_tokens) }}</b><span>上下文大小</span></div>
+            <div class="ug"><b>{{ usageData.totals.rounds }}</b><span>{{ t('home.usage.rounds') }}</span></div>
+            <div class="ug"><b>{{ usageData.totals.calls }}</b><span>{{ t('home.usage.calls') }}</span></div>
+            <div class="ug"><b>{{ fmtTok(usageData.totals.tokens.total) }}</b><span>{{ t('home.usage.totalTokens') }}</span></div>
+            <div class="ug" :title="t('home.usage.contextTooltip')"><b>{{ fmtCtx(usageData.totals.context_tokens) }}</b><span>{{ t('home.usage.contextSize') }}</span></div>
           </div>
           <div class="usage-break muted">
-            输入 {{ fmtTok(usageData.totals.tokens.input) }} · 输出
-            {{ fmtTok(usageData.totals.tokens.output) }} · 推理
-            {{ fmtTok(usageData.totals.tokens.reasoning) }} · 缓存读
-            {{ fmtTok(usageData.totals.tokens.cache_read) }} · 缓存写
-            {{ fmtTok(usageData.totals.tokens.cache_write) }} · 总耗时
-            {{ fmtDur(usageData.totals.duration_sec) }}
+            {{ t('home.usage.breakdown', {
+              input: fmtTok(usageData.totals.tokens.input),
+              output: fmtTok(usageData.totals.tokens.output),
+              reasoning: fmtTok(usageData.totals.tokens.reasoning),
+              cacheRead: fmtTok(usageData.totals.tokens.cache_read),
+              cacheWrite: fmtTok(usageData.totals.tokens.cache_write),
+              duration: fmtDur(usageData.totals.duration_sec),
+            }) }}
           </div>
 
           <!-- 每轮对话统计 -->
-          <div class="detail-sub">每轮对话统计</div>
+          <div class="detail-sub">{{ t('home.usage.roundsTitle') }}</div>
           <div v-if="!usageData.rounds.length" class="center muted" style="padding: 10px 0">
-            暂无对话记录{{ usageData.session_id ? '' : '（会话尚未创建）' }}
+            {{ usageData.session_id ? t('home.usage.noRounds') : t('home.usage.noRoundsNoSession') }}
           </div>
           <div v-for="r in usageData.rounds" :key="r.round" class="round-card">
             <div class="rc-head">
-              <span class="rc-no">第 {{ r.round }} 轮</span>
+              <span class="rc-no">{{ t('home.round.number', { n: r.round }) }}</span>
               <span
                 class="st"
                 :class="{ green: r.status === 'done', blue: r.status === 'running', gray: r.status === 'pending' }"
               >{{
-                r.status === 'running' ? '执行中' : r.status === 'pending' ? '等待回复' : '已完成'
+                r.status === 'running' ? t('state.running') : r.status === 'pending' ? t('state.pendingReply') : t('state.completed')
               }}</span>
               <span class="muted rc-time">{{ r.started_at ? r.started_at.slice(5, 16).replace('T', ' ') : '' }}</span>
             </div>
             <div v-if="r.preview" class="rc-preview">{{ r.preview }}</div>
             <div class="rc-stats">
-              <span>调用 {{ r.calls }}</span>
-              <span>Token {{ fmtTok(r.tokens.total) }}</span>
-              <span>入 {{ fmtTok(r.tokens.input) }}</span>
-              <span>出 {{ fmtTok(r.tokens.output) }}</span>
-              <span>推理 {{ fmtTok(r.tokens.reasoning) }}</span>
-              <span>缓存 {{ fmtTok(r.tokens.cache_read + r.tokens.cache_write) }}</span>
-              <span>费用 {{ fmtCost(r.cost) }}</span>
-              <span>耗时 {{ fmtDur(r.duration_sec) }}</span>
+              <span>{{ t('home.round.calls', { n: r.calls }) }}</span>
+              <span>{{ t('home.round.token', { n: fmtTok(r.tokens.total) }) }}</span>
+              <span>{{ t('home.round.input', { n: fmtTok(r.tokens.input) }) }}</span>
+              <span>{{ t('home.round.output', { n: fmtTok(r.tokens.output) }) }}</span>
+              <span>{{ t('home.round.reasoning', { n: fmtTok(r.tokens.reasoning) }) }}</span>
+              <span>{{ t('home.round.cache', { n: fmtTok(r.tokens.cache_read + r.tokens.cache_write) }) }}</span>
+              <span>{{ t('home.round.cost', { c: fmtCost(r.cost) }) }}</span>
+              <span>{{ t('home.fmt.duration', { time: fmtDur(r.duration_sec) }) }}</span>
             </div>
-            <div v-if="r.models.length" class="rc-model muted">模型 {{ r.models.join('、') }}</div>
+            <div v-if="r.models.length" class="rc-model muted">{{ t('home.round.models', { list: r.models.join(locale === 'zh-CN' ? '、' : ', ') }) }}</div>
           </div>
         </template>
       </div>
@@ -1037,7 +1056,7 @@ onUnmounted(() => {
     <div class="preview-overlay" :class="{ show: !!previewArt }">
       <template v-if="previewArt && detailTask">
         <div class="preview-bar">
-          <button class="btn sm line" @click="closePreview">← 返回</button>
+          <button class="btn sm line" @click="closePreview">{{ t('home.action.back') }}</button>
           <span class="preview-name" :title="previewArt.rel_path">{{ previewArt.filename }}</span>
           <!-- Markdown：渲染 / 源码 双视图切换 -->
           <span v-if="isMdExt(previewArt.filename) && !mdError && !mdLoading" class="md-toggle">
@@ -1045,22 +1064,22 @@ onUnmounted(() => {
               class="btn sm"
               :class="mdMode === 'render' ? 'primary' : 'line'"
               @click="mdMode = 'render'"
-            >渲染</button>
+            >{{ t('home.md.render') }}</button>
             <button
               class="btn sm"
               :class="mdMode === 'source' ? 'primary' : 'line'"
               @click="mdMode = 'source'"
-            >源码</button>
+            >{{ t('home.md.source') }}</button>
           </span>
-          <a class="btn sm green" :href="artifactUrl(detailTask.task_id, previewArt.artifact_id)" :download="previewArt.filename">下载</a>
+          <a class="btn sm green" :href="artifactUrl(detailTask.task_id, previewArt.artifact_id)" :download="previewArt.filename">{{ t('home.action.download') }}</a>
         </div>
         <div class="preview-body" :class="{ 'md-body': isMdExt(previewArt.filename) }" @click.self="closePreview">
           <!-- Markdown：前端渲染成文档（标题/表格/列表/代码高亮/图片内链…） -->
           <div v-if="isMdExt(previewArt.filename)" class="md-wrap" @click="onMdClick">
-            <div v-if="mdLoading" class="center muted" style="padding: 40px 0">Markdown 渲染中…</div>
+            <div v-if="mdLoading" class="center muted" style="padding: 40px 0">{{ t('home.md.rendering') }}</div>
             <div v-else-if="mdError" class="md-error">
               <p>{{ mdError }}</p>
-              <button class="btn sm line" @click.stop="retryMd">重试</button>
+              <button class="btn sm line" @click.stop="retryMd">{{ t('common.retry') }}</button>
             </div>
             <pre v-else-if="mdMode === 'source'" class="md-source">{{ mdRaw }}</pre>
             <article v-else class="md-view" v-html="mdHtml"></article>
@@ -1083,13 +1102,13 @@ onUnmounted(() => {
     <div class="overlay msg-overlay" :class="{ show: !!fullMsg }" @click.self="fullMsg = null">
       <div v-if="fullMsg" class="sheet msg-sheet">
         <div class="sheet-head">
-          <h3>{{ fullMsg.role === 'user' ? '我' : 'MiMoCode' }}</h3>
-          <button class="close-x" aria-label="关闭" @click="fullMsg = null">
+          <h3>{{ fullMsg.role === 'user' ? t('home.msg.me') : 'MiMoCode' }}</h3>
+          <button class="close-x" :aria-label="t('common.close')" @click="fullMsg = null">
             <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
         <div class="msg-full-meta muted">
-          发送时间 {{ fullMsg.created_at?.slice(0, 19).replace('T', ' ') }}
+          {{ t('home.msg.sentAt', { time: fullMsg.created_at?.slice(0, 19).replace('T', ' ') || '' }) }}
         </div>
         <div class="msg-full-body">{{ fullMsg.content }}</div>
         <div v-if="fullMsg.attachments?.length" class="msg-atts" style="padding-left: 0">

@@ -673,7 +673,7 @@ export function mountSysApi(app) {
       .get(...args).n;
     const rows = db
       .prepare(
-        `SELECT op_id, occurred_at, action, content, result_code
+        `SELECT op_id, occurred_at, action, content, result_code, action_key, result_msg
          FROM operation_log WHERE ${where.join(" AND ")}
          ORDER BY occurred_at DESC, op_id DESC LIMIT ?`
       )
@@ -725,7 +725,7 @@ export function mountSysApi(app) {
       .get(...args).n;
     const rows = db
       .prepare(
-        `SELECT op_id, occurred_at, action, content, result_code
+        `SELECT op_id, occurred_at, action, content, result_code, action_key, result_msg
          FROM operation_log WHERE ${where.join(" AND ")}
          ORDER BY occurred_at DESC, op_id DESC LIMIT ? OFFSET ?`
       )
@@ -795,6 +795,9 @@ function toLogItem(row) {
     id: row.op_id,
     time: String(row.occurred_at).slice(11, 16),
     action: row.action,
+    // 纯增量字段：action_key 供前端 i18n（oplog.<key>），老数据为 null 时前端回退 action 原文
+    action_key: row.action_key,
+    result_msg: row.result_msg,
     content: row.content,
     level: row.result_code === 0 ? "success" : "error",
     resultCode: row.result_code,

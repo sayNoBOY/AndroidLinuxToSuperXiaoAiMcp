@@ -2,6 +2,7 @@
 import { ref, onMounted } from 'vue'
 import { login } from '../api/auth.js'
 import { push } from '../router.js'
+import { t, errText, locale, setLocale, LOCALES } from '../i18n/index.js'
 
 // 依据 随身互联开发文档/设计/登录页/登录页.html 移植，接真实 /api/v1/auth 接口
 // 默认账号来自 LoginApi.js 初始化的管理员（密码可用 ADMIN_PASSWORD 覆盖）
@@ -31,15 +32,15 @@ async function doLogin() {
   if (loading.value) return
   const u = username.value.trim()
   const p = password.value
-  if (!u) return toast('请输入用户名')
-  if (!p) return toast('请输入密码')
+  if (!u) return toast(t('login.validation.usernameRequired'))
+  if (!p) return toast(t('login.validation.passwordRequired'))
 
   loading.value = true
   try {
     await login(u, p, remember.value)
     push('/')
   } catch (e) {
-    toast(e?.message || '登录失败，请稍后重试')
+    toast(errText(e, 'login.error.loginFailed'))
   } finally {
     loading.value = false
   }
@@ -59,18 +60,30 @@ onMounted(() => {
       <div class="orb orb-3"></div>
     </div>
 
+    <!-- 语言切换：右上角极简文字链 -->
+    <div class="lang-switch">
+      <button
+        v-for="loc in LOCALES"
+        :key="loc.value"
+        type="button"
+        class="lang-btn"
+        :class="{ on: locale === loc.value }"
+        @click="setLocale(loc.value)"
+      >{{ loc.label }}</button>
+    </div>
+
     <!-- Logo -->
     <div class="brand">
       <div class="brand-icon">🔗</div>
-      <h1>智衍</h1>
-      <p>无限自进化，随你所想</p>
+      <h1>{{ t('login.brand.name') }}</h1>
+      <p>{{ t('login.brand.slogan') }}</p>
     </div>
 
     <!-- 表单 -->
     <div class="form-wrap">
       <form class="card" @submit.prevent="doLogin">
-        <div class="card-title">账号登录</div>
-        <div class="card-subtitle">请输入管理员账号和密码</div>
+        <div class="card-title">{{ t('login.form.title') }}</div>
+        <div class="card-subtitle">{{ t('login.form.subtitle') }}</div>
 
         <div class="field">
           <span class="icon">👤</span>
@@ -78,7 +91,7 @@ onMounted(() => {
             id="username"
             v-model="username"
             type="text"
-            placeholder="用户名"
+            :placeholder="t('login.form.username')"
             autocomplete="username"
           />
         </div>
@@ -88,7 +101,7 @@ onMounted(() => {
             id="password"
             v-model="password"
             :type="showPwd ? 'text' : 'password'"
-            placeholder="密码"
+            :placeholder="t('login.form.password')"
             autocomplete="current-password"
           />
           <button class="toggle-pwd" type="button" @click="togglePwd">
@@ -100,19 +113,19 @@ onMounted(() => {
           <label class="check-wrap">
             <input v-model="remember" type="checkbox" />
             <span class="check-box"></span>
-            记住登录
+            {{ t('login.form.remember') }}
           </label>
-          <a class="forgot" href="javascript:void(0)" @click="toast('请联系管理员重置密码')">忘记密码?</a>
+          <a class="forgot" href="javascript:void(0)" @click="toast(t('login.form.forgotHint'))">{{ t('login.form.forgot') }}</a>
         </div>
 
         <button class="btn-primary" :class="{ loading }" type="submit" :disabled="loading">
-          <span class="btn-text">登 录</span>
+          <span class="btn-text">{{ t('login.form.submit') }}</span>
           <div class="spinner"></div>
           <div class="shine"></div>
         </button>
 
         <div class="default-hint">
-          默认账号：{{ DEFAULT_USERNAME }}　默认密码：{{ DEFAULT_PASSWORD }}
+          {{ t('login.form.defaultAccount', { user: DEFAULT_USERNAME, pass: DEFAULT_PASSWORD }) }}
         </div>
       </form>
     </div>
@@ -122,7 +135,7 @@ onMounted(() => {
 
     <!-- 底部 -->
     <div class="footer">
-      <p>随身互联 v1.0 · 局域网管理系统</p>
+      <p>{{ t('login.footer') }}</p>
     </div>
   </div>
 </template>
@@ -158,6 +171,19 @@ onMounted(() => {
   -webkit-mask-image: linear-gradient(to bottom, rgba(0,0,0,.4), transparent 70%);
   mask-image: linear-gradient(to bottom, rgba(0,0,0,.4), transparent 70%);
 }
+
+/* ========== 语言切换（右上角文字链） ========== */
+.lang-switch {
+  position: absolute; top: 14px; right: 14px; z-index: 5;
+  display: flex; align-items: center; gap: 12px;
+}
+.lang-btn {
+  background: none; border: none; padding: 2px 0; cursor: pointer;
+  font-family: inherit; font-size: 12px; line-height: 1.4;
+  color: var(--t3); letter-spacing: .2px; transition: color .2s;
+}
+.lang-btn:hover { color: var(--t2) }
+.lang-btn.on { color: var(--t1); font-weight: 600 }
 
 /* ========== Logo + 标题 ========== */
 .brand { position: relative; z-index: 2; text-align: center; padding-top: clamp(60px, 14vh, 100px) }

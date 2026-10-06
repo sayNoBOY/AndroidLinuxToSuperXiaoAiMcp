@@ -7,6 +7,8 @@ import {
   getLlmInfo, switchLlmModel, addLlmProvider, removeLlmProvider,
 } from '../api/system.js'
 import { changePassword } from '../api/auth.js'
+import { t, tExists, errText, locale, setLocale, LOCALES } from '../i18n/index.js'
+import { fmtUptime } from '../i18n/date.js'
 
 // 依据 随身互联App四Tab原型(6).html Tab4「我的」实现，接口对接 SysApi.js：
 //   status / metrics 10s 轮询（文档口径 5~10s），logs 首次 + 重启完成时刷新，
@@ -23,7 +25,9 @@ const lastSync = ref('')    // 最后同步时间（yyyy-MM-dd HH:mm:ss）
 // 运行时间：以最近一次 status.uptimeSeconds 为基线，本地每秒累加显示
 const upBase = ref(0)
 const upAt = ref(0)
-const uptimeText = ref('—')
+const upSec = ref(0)
+// computed 派生：切语言时 fmt.uptime 模板立即随 locale 重算（无需等下一次 tick）
+const uptimeText = computed(() => (status.value ? fmtUptime(upSec.value, t) : '—'))
 
 const rebooting = ref(false) // restarting 期间防重复触发
 
@@ -52,15 +56,15 @@ const stateCls = computed(() => STATE_CLS[status.value?.state] || 'gray')
 
 const cpuText = computed(() => {
   const c = metrics.value?.cpu
-  return c ? `${c.percent}% · ${c.model}` : '—'
+  return c ? t('service.field.cpuValue', { pct: c.percent, model: c.model }) : '—'
 })
 const memText = computed(() => {
   const m = metrics.value?.memory
-  return m ? `${m.percent}% · ${m.usedGb}/${m.totalGb} GB` : '—'
+  return m ? t('service.field.usageValue', { pct: m.percent, used: m.usedGb, total: m.totalGb }) : '—'
 })
 const diskText = computed(() => {
   const d = metrics.value?.disk
-  return d ? `${d.percent}% · ${d.usedGb}/${d.totalGb} GB` : '—'
+  return d ? t('service.field.usageValue', { pct: d.percent, used: d.usedGb, total: d.totalGb }) : '—'
 })
 
 // 当前服务访问地址：本页前端实际访问的 origin（hash 路由不计入地址，局域网/localhost 随打开方式变化）
@@ -73,15 +77,6 @@ function barColor(p) {
   return 'var(--green)'
 }
 
-function fmtUptime(sec) {
-  const p = (n) => String(n).padStart(2, '0')
-  const d = Math.floor(sec / 86400)
-  const h = Math.floor((sec % 86400) / 3600)
-  const m = Math.floor((sec % 3600) / 60)
-  const s = sec % 60
-  return `${d}天 ${p(h)}:${p(m)}:${p(s)}`
-}
-
 function nowText() {
   const d = new Date()
   const p = (n) => String(n).padStart(2, '0')
@@ -91,7 +86,7 @@ function nowText() {
 function tickUptime() {
   if (!status.value) return
   const sec = upBase.value + Math.floor((Date.now() - upAt.value) / 1000)
-  uptimeText.value = fmtUptime(Math.max(0, sec))
+  upSec.value = Math.max(0, sec)
 }
 
 // ---------- 数据加载 ----------
@@ -117,7 +112,7 @@ async function loadRuntime() {
   const rs = await Promise.allSettled([loadStatus(), loadMetrics()])
   const first = rs.find((r) => r.status === 'rejected')
   if (first) {
-    if (!rebooting.value) toast(first.reason?.message || '状态刷新失败')
+    if (!rebooting.value) toast(errText(first.reason, 'service.statusRefreshFailed'))
     return false
   }
   return true
@@ -179,7 +174,7 @@ async function waitServerBack() {
     }
     rebooting.value = false
     clearRebooting()
-    toast('服务器已重启完成 ✓')
+    toast(t('service.rebootDone'))
     await Promise.allSettled([loadMetrics(), loadLogs()])
     lastSync.value = nowText()
     return
@@ -187,7 +182,7 @@ async function waitServerBack() {
   if (!alive) return // 离开页面：保留 sessionStorage 标记，回来 onMounted 续等
   rebooting.value = false
   clearRebooting()
-  toast('重启超时，请刷新页面查看状态')
+  toast(t('service.rebootTimeout'))
 }
 
 async function reboot() {
@@ -200,11 +195,11 @@ async function reboot() {
   } catch (e) {
     // 响应已发出但连接随进程被杀而断（网络层错误）→ 仍按已触发处理；
     // 业务错误（409 重复触发等）才直接报错退出
-    if (e.type !== 'NETWORK_ERROR') return toast(e?.message || '重启失败')
+    if (e.type !== 'NETWORK_ERROR') return toast(errText(e, 'service.rebootFailed'))
   }
   markRebooting()
   rebooting.value = true
-  toast('服务器正在重启…')
+  toast(t('service.rebooting'))
   await waitServerBack()
 }
 
@@ -222,7 +217,7 @@ async function loadAllLogs() {
     logTotal.value = d.total
     logHasMore.value = d.hasMore
   } catch (e) {
-    toast(e?.message || '日志加载失败')
+    toast(errText(e, 'service.logsLoadFailed'))
   } finally {
     logLoading.value = false
   }
@@ -260,6 +255,23 @@ function logDay(t) {
   return String(t || '').slice(5, 16).replace('T', ' ')
 }
 
+/** 日志行 action：有 action_key 且语言包有 oplog.<key> 则翻译，否则回退后端 action 原文（老数据兼容） */
+function actionText(l) {
+  return l.action_key && tExists(`oplog.${l.action_key}`) ? t(`oplog.${l.action_key}`) : l.action
+}
+
+/**
+ * 日志行 content：无 action_key（后端双写未上线/老数据）回退 content 原文；
+ * 有则按后端生成规则重建（{action}成功 / {action}：{msg}），en 才能翻。
+ */
+function contentText(l) {
+  if (!l.action_key) return l.content
+  const action = actionText(l)
+  const code = l.resultCode ?? l.result_code
+  if (code === 0) return t('oplog.content.ok', { action })
+  return t('oplog.content.err', { action, msg: l.result_msg || t('common.fail') })
+}
+
 // ---------- MiMoCode 大模型调用信息（GET /server/llm：配置文件 + 当前模型 + 模型目录） ----------
 const llm = ref(null)        // GET /server/llm 响应 data
 const llmLoading = ref(false)
@@ -294,12 +306,12 @@ function fmtTokens(n) {
 const llmWindowText = computed(() => {
   const m = activeModel.value
   if (!m) return '—'
-  return `${fmtTokens(m.context)} tokens · 输出 ${fmtTokens(m.output)}`
+  return t('service.llm.window', { ctx: fmtTokens(m.context), out: fmtTokens(m.output) })
 })
 const llmCostText = computed(() => {
   const c = activeModel.value?.cost
   if (!c) return '—'
-  return `输入 ${c.input} · 输出 ${c.output}`
+  return t('service.llm.cost', { input: c.input, output: c.output })
 })
 const llmUrlText = computed(() => activeModel.value?.api?.url || '—')
 /** 配置来源：config=顶层 model（哪个文件），state=运行态 recent，default=MiMoCode 默认 */
@@ -308,21 +320,39 @@ const llmSourceText = computed(() => {
   if (!c) return '—'
   if (c.source === 'config') return `${c.sourceFile?.split('/').slice(-2).join('/')} · model`
   if (c.source === 'state') return `${c.stateFile?.split('/').slice(-2).join('/')} · recent`
-  return 'MiMoCode 默认'
+  return t('llm.source.default')
 })
 const llmCapText = computed(() => {
   const caps = activeModel.value?.capabilities
   if (!caps) return '—'
   const tags = []
-  if (caps.reasoning) tags.push('推理')
-  if (caps.toolcall) tags.push('工具调用')
-  if (caps.attachment) tags.push('附件')
+  if (caps.reasoning) tags.push(t('llm.cap.reasoning'))
+  if (caps.toolcall) tags.push(t('llm.cap.toolcall'))
+  if (caps.attachment) tags.push(t('llm.cap.attachment'))
   const input = caps.input || {}
-  if (input.image) tags.push('图像输入')
-  if (input.audio) tags.push('音频输入')
-  if (input.video) tags.push('视频输入')
+  if (input.image) tags.push(t('llm.cap.image'))
+  if (input.audio) tags.push(t('llm.cap.audio'))
+  if (input.video) tags.push(t('llm.cap.video'))
   return tags.length ? tags.join(' · ') : '—'
 })
+const llmCredsText = computed(() =>
+  llmCreds.value.length
+    ? llmCreds.value.map((c) => `${c.provider}(${c.hasKey ? t('service.llm.hasKey') : t('service.llm.noKey')})`).join(' · ')
+    : t('service.llm.unconfigured'),
+)
+
+/** 后端下发标签的 key 覆盖：有 key 用 key，查不到回退服务端原值（自定义 provider / 未知 id） */
+const presetText = (p) => (tExists(`llm.preset.${p.id}`) ? t(`llm.preset.${p.id}`) : p.label)
+const adapterText = (a) => (a.id && tExists(`llm.adapter.${a.id}`) ? t(`llm.adapter.${a.id}`) : a.label)
+/** 成功 toast 里的 6 项能力回显（短词：图像/音频/视频，与表单「图像输入」等标签区分） */
+const CAP_ECHO_KEYS = {
+  reasoning: 'llm.cap.reasoning',
+  tool_call: 'llm.cap.toolcall',
+  attachment: 'llm.cap.attachment',
+  image: 'llm.cap.imageShort',
+  audio: 'llm.cap.audioShort',
+  video: 'llm.cap.videoShort',
+}
 
 async function loadLlm({ refresh = false, quiet = true } = {}) {
   llmLoading.value = true
@@ -330,7 +360,7 @@ async function loadLlm({ refresh = false, quiet = true } = {}) {
     llm.value = await getLlmInfo({ refresh })
     llmError.value = llm.value?.listError || ''
   } catch (e) {
-    llmError.value = e?.message || '大模型信息加载失败'
+    llmError.value = errText(e, 'service.llm.infoLoadFailed')
     if (!quiet) toast(llmError.value)
   } finally {
     llmLoading.value = false
@@ -374,9 +404,9 @@ const swAllHidden = computed(
 /** 弹窗「当前模型」：当前值是被清掉的内置默认项时标成未配置，避免看着像已配置 */
 const swCurText = computed(() => {
   const k = activeKey.value
-  if (!k) return '未配置'
+  if (!k) return t('service.llm.unconfigured')
   const provider = k.includes('/') ? k.split('/')[0] : ''
-  return isBuiltinDefaultProvider(provider) ? `未配置（MiMoCode 内置默认 ${k}）` : k
+  return isBuiltinDefaultProvider(provider) ? t('service.llm.unconfiguredBuiltin', { key: k }) : k
 })
 const swSelectedModel = computed(() => llmModels.value.find((m) => m.key === swSelected.value) || null)
 const swIsGroup = computed(() => Boolean(swSelected.value) && !swSelected.value.includes('/'))
@@ -405,7 +435,7 @@ async function refreshCatalog() {
   swRefreshing.value = true
   try {
     await loadLlm({ refresh: true, quiet: false })
-    if (!llm.value?.models?.length) toast(llmError.value || '模型目录为空')
+    if (!llm.value?.models?.length) toast(llmError.value || t('service.llm.catalogEmpty'))
   } finally {
     swRefreshing.value = false
   }
@@ -418,10 +448,10 @@ async function confirmSwitch() {
   try {
     const r = await switchLlmModel(swSelected.value)
     swOpen.value = false
-    toast(`已切换到 ${r.model} ✓`)
+    toast(t('service.llm.switched', { model: r.model }))
     await loadLlm({ refresh: true, quiet: false })
   } catch (e) {
-    swError.value = e?.message || '切换失败'
+    swError.value = errText(e, 'service.llm.switchFailed')
   } finally {
     swSwitching.value = false
   }
@@ -443,14 +473,14 @@ function blankAddForm() {
   return {
     providerId: '', name: '', npm: '@ai-sdk/openai-compatible',
     baseURL: '', modelId: '', modelName: '', apiKey: '', setAsCurrent: true,
-    // 6 项能力手动标定（默认=CLI 缺省：仅工具调用开）；提交时全量传 capabilities
-    caps: { reasoning: false, tool_call: true, attachment: false, image: false, audio: false, video: false },
+    // 6 项能力手动标定（默认全选，可按模型实际能力取消勾选）；提交时全量传 capabilities
+    caps: { reasoning: true, tool_call: true, attachment: true, image: true, audio: true, video: true },
   }
 }
 const adForm = ref(blankAddForm())
 const adConfirmDel = ref('')   // 两步删除：先点 × 进入「确认」态，再点一次才删（不用原生 confirm）
 const adPresets = computed(() => llm.value?.presets || [])
-const adAdapters = computed(() => llm.value?.adapters || [{ npm: '@ai-sdk/openai-compatible', label: 'OpenAI 兼容' }])
+const adAdapters = computed(() => llm.value?.adapters || [{ npm: '@ai-sdk/openai-compatible', label: t('llm.adapter.openaiFallback') }])
 /** 已配置的自定义 provider（可删）与内置目录 provider（只读展示） */
 const adCustom = computed(() => llm.value?.config?.customProviders || [])
 const adCatalog = computed(() => llm.value?.providers || [])
@@ -464,6 +494,12 @@ const adIsCatalog = computed(() => adCatalog.value.includes(adForm.value.provide
 const adCatalogModels = computed(() =>
   llmModels.value.filter((m) => m.providerID === adForm.value.providerId.trim()).map((m) => m.key),
 )
+/** 内置目录 provider 并入提示：模型最多列 4 个，超出由语言包补「等」后缀 */
+const adCatalogHint = computed(() => {
+  const list = adCatalogModels.value.slice(0, 4)
+  const models = list.join('、') + (adCatalogModels.value.length > 4 ? t('service.llm.etcMore') : '')
+  return t('service.llm.catalogHint', { id: adForm.value.providerId.trim(), models })
+})
 const adCanSubmit = computed(() =>
   !adSaving.value &&
   adForm.value.providerId && adForm.value.npm && adForm.value.baseURL && adForm.value.modelId,
@@ -528,24 +564,26 @@ async function submitAdd() {
     adOpen.value = false
     if (r.verified) {
       const warn = r.endpointConflicts?.length
-        ? `（${(r.preservedCatalogModels || []).join('、')} 已并入，端点改用新 baseURL）`
+        ? t('service.llm.mergedWarn', { models: (r.preservedCatalogModels || []).join('、') })
         : ''
       // xiaomi 特殊处理：auth 登录连接 / Provider ID 归一（mimo→xiaomi）时在 toast 里点明
       const idText = r.requestedProviderId && r.requestedProviderId !== r.providerId
         ? `${r.requestedProviderId}→${r.providerId}`
         : r.providerId
-      const authTag = r.viaAuth?.used ? '，已走 auth 登录连接' : ''
+      const authTag = r.viaAuth?.used ? t('service.llm.viaAuth') : ''
       // 能力回显：6 项手动标定结果附在成功提示里（勾选项列出，全不勾提示纯文本）
       const caps = r.capabilities || {}
       const capTags = ['reasoning', 'tool_call', 'attachment', 'image', 'audio', 'video']
         .filter((k) => caps[k])
-        .map((k) => ({ reasoning: '推理', tool_call: '工具调用', attachment: '附件', image: '图像', audio: '音频', video: '视频' })[k])
-      const capTag = capTags.length ? ` · 能力：${capTags.join('/')}` : ' · 能力：仅文本'
-      toast(`已新增 ${idText}${r.model ? ` · 当前模型 ${r.model}` : ''} ✓${authTag}${capTag}${warn}`)
+        .map((k) => t(CAP_ECHO_KEYS[k]))
+      const capTag = capTags.length
+        ? ` · ${t('service.llm.capList', { list: capTags.join('/') })}`
+        : ` · ${t('service.llm.capTextOnly')}`
+      toast(`${t('service.llm.added', { id: idText })}${r.model ? t('service.llm.addedCurrent', { model: r.model }) : ''} ✓${authTag}${capTag}${warn}`)
     } else toast(r.note)
     await loadLlm({ refresh: true, quiet: false })
   } catch (e) {
-    adError.value = e?.message || '新增失败'
+    adError.value = errText(e, 'service.llm.addFailed')
   } finally {
     adSaving.value = false
   }
@@ -565,10 +603,10 @@ function onDelClick(id) {
 async function removeProvider(id) {
   try {
     const r = await removeLlmProvider(id)
-    toast(`已删除 ${r.providerId} ✓`)
+    toast(t('service.llm.deleted', { id: r.providerId }))
     await loadLlm({ refresh: true, quiet: false })
   } catch (e) {
-    toast(e?.message || '删除失败')
+    toast(errText(e, 'service.llm.deleteFailed'))
   }
 }
 
@@ -613,9 +651,9 @@ async function submitPwd() {
     await changePassword(pwdForm.value.current, pwdForm.value.next, pwdForm.value.confirm)
     pwdOpen.value = false
     pwdForm.value = { current: '', next: '', confirm: '' }
-    toast('登录密码修改成功 ✓')
+    toast(t('service.changePwd.success'))
   } catch (e) {
-    pwdError.value = e?.message || '修改失败'
+    pwdError.value = errText(e, 'service.changePwd.failed')
   } finally {
     pwdSaving.value = false
   }
@@ -643,15 +681,17 @@ const ABOUT_REPO = Object.freeze({
 
 // 任务 84（taskRes/84/打包验证记录.txt + 任务报告.md）：se9 APK 用 aapt2/apksigner 实测
 // （versionCode 20261002 · 212,105,792 B · 同证书 d2df32db…），版本号按要求 +1 → se10。
-const ABOUT_PKG = Object.freeze([
-  { k: '打包任务', v: '#84 重打包（73号修复 · 终版 se10）' },
-  { k: '应用名称', v: '智衍 SelfEvolution' },
-  { k: '包名', v: 'com.termux' },
-  { k: '版本', v: 'versionName 0.118.0-se10 · versionCode 20261002' },
-  { k: 'APK', v: 'SelfEvolution-v0.118.0-se10-universal.apk（212,105,792 字节 ≈ 202 MB）' },
-  { k: '签名', v: 'CN=SelfEvolution, OU=SE, O=SelfEvolution, C=CN' },
-  { k: 'SDK', v: 'minSdk 21 · targetSdk 28 · compileSdk 36' },
-  { k: '构建日期', v: '2026-10-04' },
+// 值为固定展示数据不翻译（zh/en 同文）：含中文的值放语言包仅为硬编码扫描归零；
+// label 走 service.about.*，computed 包裹保证切语言即时重算。
+const ABOUT_PKG = computed(() => [
+  { k: t('service.about.pkgTask'), v: t('service.about.pkgTaskValue') },
+  { k: t('service.about.appName'), v: t('service.about.appNameValue') },
+  { k: t('service.about.pkgName'), v: 'com.termux' },
+  { k: t('service.about.version'), v: 'versionName 0.118.0-se10 · versionCode 20261002' },
+  { k: t('service.about.apk'), v: t('service.about.apkValue') },
+  { k: t('service.about.signing'), v: 'CN=SelfEvolution, OU=SE, O=SelfEvolution, C=CN' },
+  { k: t('service.about.sdk'), v: 'minSdk 21 · targetSdk 28 · compileSdk 36' },
+  { k: t('service.about.buildDate'), v: '2026-10-04' },
 ])
 
 function openAbout() {
@@ -701,7 +741,7 @@ onUnmounted(() => {
   <div class="page">
     <!-- 内容区 -->
     <div class="content">
-      <div class="sect-title"><span class="bar" style="background: var(--blue)"></span>服务器状态</div>
+      <div class="sect-title"><span class="bar" style="background: var(--blue)"></span>{{ t('service.section.status') }}</div>
 
       <!-- 服务器概览卡 -->
       <div class="card">
@@ -714,44 +754,44 @@ onUnmounted(() => {
             </svg>
           </div>
           <div class="srv-main">
-            <div class="srv-name">{{ status?.name || '随身互联服务器' }}</div>
+            <div class="srv-name">{{ status?.name || t('service.serverName') }}</div>
             <div class="srv-state-row">
               <span class="dot" :class="'bg-' + stateCls" :style="rebooting ? '' : 'animation: breath 1.6s infinite'"></span>
-              <span class="srv-state" :class="stateCls">{{ status?.stateText || '连接中…' }}</span>
+              <span class="srv-state" :class="stateCls">{{ status?.stateText || t('service.connecting') }}</span>
             </div>
           </div>
           <div class="srv-up">
             <div class="up-v">{{ uptimeText }}</div>
-            <div class="up-l">运行时间</div>
+            <div class="up-l">{{ t('service.field.uptime') }}</div>
           </div>
         </div>
-        <div class="kv"><span class="k">IP 地址</span><span class="v">{{ status?.ip || '—' }}</span></div>
-        <div class="kv"><span class="k">操作系统</span><span class="v">{{ status?.os || '—' }}</span></div>
+        <div class="kv"><span class="k">{{ t('service.field.ip') }}</span><span class="v">{{ status?.ip || '—' }}</span></div>
+        <div class="kv"><span class="k">{{ t('service.field.os') }}</span><span class="v">{{ status?.os || '—' }}</span></div>
         <div class="kv">
-          <span class="k">CPU 核心</span>
-          <span class="v">{{ status ? `${status.cpuCores} 核 ${status.cpuModel}` : '—' }}</span>
+          <span class="k">{{ t('service.field.cpuCores') }}</span>
+          <span class="v">{{ status ? t('service.field.coresValue', { cores: status.cpuCores, model: status.cpuModel }) : '—' }}</span>
         </div>
-        <div class="kv"><span class="k">当前服务访问地址</span><span class="v">{{ frontendAddr }}</span></div>
+        <div class="kv"><span class="k">{{ t('service.field.accessAddress') }}</span><span class="v">{{ frontendAddr }}</span></div>
       </div>
 
       <!-- CPU / 内存 / 磁盘 -->
       <div class="bigrow">
         <div class="card m-card">
-          <div class="m-label">CPU 使用率</div>
+          <div class="m-label">{{ t('service.field.cpu') }}</div>
           <div class="pbar anim">
             <div :style="{ width: (metrics?.cpu.percent ?? 0) + '%', background: barColor(metrics?.cpu.percent ?? 0) }"></div>
           </div>
           <div class="m-txt">{{ cpuText }}</div>
         </div>
         <div class="card m-card">
-          <div class="m-label">内存</div>
+          <div class="m-label">{{ t('service.field.memory') }}</div>
           <div class="pbar anim">
             <div :style="{ width: (metrics?.memory.percent ?? 0) + '%', background: barColor(metrics?.memory.percent ?? 0) }"></div>
           </div>
           <div class="m-txt">{{ memText }}</div>
         </div>
         <div class="card m-card">
-          <div class="m-label">磁盘</div>
+          <div class="m-label">{{ t('service.field.disk') }}</div>
           <div class="pbar anim">
             <div :style="{ width: (metrics?.disk.percent ?? 0) + '%', background: barColor(metrics?.disk.percent ?? 0) }"></div>
           </div>
@@ -762,9 +802,9 @@ onUnmounted(() => {
       <!-- MiMoCode 大模型调用信息（读 mimocode 配置 / 运行态 / 模型目录） -->
       <div class="card">
         <div class="card-title llm-title">
-          <span>MiMoCode 大模型</span>
+          <span>{{ t('service.section.llm') }}</span>
           <span class="llm-badge" :class="llmCurrent ? 'ok' : 'gray'">
-            {{ llmLoading && !llm ? '读取中…' : llmError ? '目录异常' : llmCurrent ? '已接入' : '未读取' }}
+            {{ llmLoading && !llm ? t('service.llm.reading') : llmError ? t('service.llm.listError') : llmCurrent ? t('service.llm.connected') : t('service.llm.notRead') }}
           </span>
         </div>
 
@@ -776,26 +816,26 @@ onUnmounted(() => {
             </svg>
           </div>
           <div class="llm-hero-main">
-            <div class="llm-name">{{ activeModel?.name || activeKey || 'MiMoCode 默认' }}</div>
+            <div class="llm-name">{{ activeModel?.name || activeKey || t('llm.source.default') }}</div>
             <div class="llm-key">{{ activeKey || '—' }}</div>
           </div>
           <span class="st" :class="activeModel?.status === 'active' ? 'green' : 'red'" v-if="activeModel">
-            {{ activeModel.status === 'active' ? '✓ 可用' : '✕ ' + (activeModel.status || '未知') }}
+            {{ activeModel.status === 'active' ? t('service.llm.statusOk') : '✕ ' + (activeModel.status || t('common.unknown')) }}
           </span>
         </div>
 
-        <div class="kv"><span class="k">提供商</span><span class="v">{{ activeModel?.providerID || llmProviders.join(' / ') || '—' }}</span></div>
-        <div class="kv"><span class="k">上下文窗口</span><span class="v">{{ llmWindowText }}</span></div>
-        <div class="kv"><span class="k">接口地址</span><span class="v">{{ llmUrlText }}</span></div>
-        <div class="kv"><span class="k">能力</span><span class="v">{{ llmCapText }}</span></div>
-        <div class="kv"><span class="k">计费 input/output</span><span class="v">{{ llmCostText }}</span></div>
-        <div class="kv"><span class="k">凭据</span>
-          <span class="v">{{ llmCreds.length ? llmCreds.map((c) => `${c.provider}(${c.hasKey ? '已配密钥' : '无密钥'})`).join(' · ') : '未配置' }}</span>
+        <div class="kv"><span class="k">{{ t('service.llm.provider') }}</span><span class="v">{{ activeModel?.providerID || llmProviders.join(' / ') || '—' }}</span></div>
+        <div class="kv"><span class="k">{{ t('service.llm.contextWindow') }}</span><span class="v">{{ llmWindowText }}</span></div>
+        <div class="kv"><span class="k">{{ t('service.llm.apiUrl') }}</span><span class="v">{{ llmUrlText }}</span></div>
+        <div class="kv"><span class="k">{{ t('service.llm.capability') }}</span><span class="v">{{ llmCapText }}</span></div>
+        <div class="kv"><span class="k">{{ t('service.llm.billing') }}</span><span class="v">{{ llmCostText }}</span></div>
+        <div class="kv"><span class="k">{{ t('service.llm.credentials') }}</span>
+          <span class="v">{{ llmCredsText }}</span>
         </div>
-        <div class="kv"><span class="k">配置来源</span><span class="v">{{ llmSourceText }}</span></div>
+        <div class="kv"><span class="k">{{ t('service.llm.source') }}</span><span class="v">{{ llmSourceText }}</span></div>
 
         <div class="llm-chips">
-          <span class="llm-chips-lab">最近使用</span>
+          <span class="llm-chips-lab">{{ t('service.llm.recent') }}</span>
           <span
             v-for="r in (llmCurrent?.recent || []).slice(0, 4)" :key="r"
             class="llm-chip" :class="{ on: r === activeKey }"
@@ -811,31 +851,45 @@ onUnmounted(() => {
               <path d="M21 12a9 9 0 0 1-15.5 6.2M3 12a9 9 0 0 1 15.5-6.2" />
               <path d="M3 21v-6h6M21 3v6h-6" />
             </svg>
-            切换大模型
+            {{ t('service.llm.switch') }}
           </button>
           <button class="btn primary" :disabled="rebooting || llmLoading" @click="openAdder">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
               <path d="M12 5v14M5 12h14" />
             </svg>
-            新增大模型
+            {{ t('service.llm.add') }}
           </button>
         </div>
       </div>
 
       <!-- 最近活动日志 -->
       <div class="card">
-        <div class="card-title">最近活动日志</div>
+        <div class="card-title">{{ t('service.section.recentLogs') }}</div>
         <div class="log-box">
           <div v-if="!logs.length" class="center muted" style="padding: 12px 0">
-            {{ loading ? '加载中…' : '暂无操作记录' }}
+            {{ loading ? t('common.loading') : t('service.logs.none') }}
           </div>
           <div v-for="l in logs" :key="l.id" class="log">
             <span class="t">{{ l.time }}</span>
             <span :style="{ color: l.level === 'success' ? 'var(--green)' : 'var(--red)' }">{{ l.level === 'success' ? '🟢' : '🔴' }}</span>
-            <span class="txt">{{ l.content }}</span>
+            <span class="txt">{{ contentText(l) }}</span>
           </div>
         </div>
-        <button class="more-btn" @click="openLogs">查看全部日志</button>
+        <button class="more-btn" @click="openLogs">{{ t('service.logs.viewAll') }}</button>
+      </div>
+
+      <!-- 语言切换：日志模块下方单选行（选项来自 LOCALES，选中态联动 locale，setLocale 持久化） -->
+      <div class="card">
+        <div class="lang-row">
+          <span class="lang-label">{{ t('service.lang.label') }}</span>
+          <div class="lang-opts">
+            <button
+              v-for="loc in LOCALES" :key="loc.value"
+              type="button" class="lang-opt" :class="{ on: locale === loc.value }"
+              @click="setLocale(loc.value)"
+            >{{ loc.label }}</button>
+          </div>
+        </div>
       </div>
 
       <!-- 操作按钮：修改密码 + 重启服务器（切换/新增大模型在上方信息模块，查看日志入口 = 「查看全部日志」） -->
@@ -845,10 +899,10 @@ onUnmounted(() => {
             <rect x="3" y="11" width="18" height="10" rx="2" />
             <path d="M7 11V7a5 5 0 0 1 10 0v4" />
           </svg>
-          修改密码
+          {{ t('service.changePwd.title') }}
         </button>
         <button class="btn red" :disabled="rebooting" @click="reboot">
-          {{ rebooting ? '重启中…' : '重启服务器' }}
+          {{ rebooting ? t('service.reboot.inProgress') : t('service.reboot.button') }}
         </button>
       </div>
       <!-- 关于软件信息：位于重启服务器按钮正下方，点开弹窗（作者/账号/开源仓库/任务84打包信息） -->
@@ -858,11 +912,11 @@ onUnmounted(() => {
             <circle cx="12" cy="12" r="10" />
             <path d="M12 16v-4M12 8h.01" />
           </svg>
-          关于软件信息
+          {{ t('service.about.title') }}
         </button>
       </div>
       <div class="center muted" style="padding-top: 12px">
-        最后同步：{{ lastSync || '—' }}
+        {{ t('service.lastSync', { time: lastSync || '—' }) }}
       </div>
     </div>
 
@@ -870,15 +924,15 @@ onUnmounted(() => {
     <div class="tabbar">
       <div class="tab" @click="push('/')">
         <svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg>
-        <span>首页</span>
+        <span>{{ t('common.tab.home') }}</span>
       </div>
       <div class="tab" @click="push('/blank')">
         <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg>
-        <span>空白</span>
+        <span>{{ t('common.tab.blank') }}</span>
       </div>
       <div class="tab on">
         <svg viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></svg>
-        <span>我的</span>
+        <span>{{ t('common.tab.me') }}</span>
       </div>
     </div>
 
@@ -889,46 +943,46 @@ onUnmounted(() => {
     <div class="overlay" :class="{ show: logsOpen }" @click.self="logsOpen = false">
       <div class="sheet sheet--logs">
         <div class="sheet-head">
-          <h3>全部操作日志</h3>
-          <button class="close-x" aria-label="关闭" title="关闭" @click="logsOpen = false">
+          <h3>{{ t('service.logs.allTitle') }}</h3>
+          <button class="close-x" :aria-label="t('common.close')" :title="t('common.close')" @click="logsOpen = false">
             <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
 
         <div class="tabs3">
-          <div class="tab3" :class="{ on: logResult === '' }" @click="setLogResult('')">全部</div>
-          <div class="tab3" :class="{ on: logResult === 'success' }" @click="setLogResult('success')">成功</div>
-          <div class="tab3" :class="{ on: logResult === 'fail' }" @click="setLogResult('fail')">失败</div>
+          <div class="tab3" :class="{ on: logResult === '' }" @click="setLogResult('')">{{ t('common.all') }}</div>
+          <div class="tab3" :class="{ on: logResult === 'success' }" @click="setLogResult('success')">{{ t('common.success') }}</div>
+          <div class="tab3" :class="{ on: logResult === 'fail' }" @click="setLogResult('fail')">{{ t('common.fail') }}</div>
         </div>
         <div class="log-search">
           <input
             v-model="logKeyword"
             class="input"
-            placeholder="搜索动作 / 内容…"
+            :placeholder="t('service.logs.search')"
             @keydown.enter="searchLogs"
           />
-          <button class="btn sm primary" @click="searchLogs">查询</button>
+          <button class="btn sm primary" @click="searchLogs">{{ t('common.query') }}</button>
         </div>
 
         <div class="log-scroll">
-          <div v-if="logLoading" class="center muted" style="padding: 20px 0">加载中…</div>
-          <div v-else-if="!logList.length" class="center muted" style="padding: 20px 0">暂无匹配的操作记录</div>
+          <div v-if="logLoading" class="center muted" style="padding: 20px 0">{{ t('common.loading') }}</div>
+          <div v-else-if="!logList.length" class="center muted" style="padding: 20px 0">{{ t('service.logs.empty') }}</div>
           <div v-for="l in logList" :key="l.id" class="log-item">
             <span class="log-when">{{ logDay(l.occurredAt) }}</span>
             <span class="st" :class="l.level === 'success' ? 'green' : 'red'">
-              {{ l.level === 'success' ? '✓ 成功' : '✕ 失败' }}
+              {{ l.level === 'success' ? t('service.logs.okMarked') : t('service.logs.failMarked') }}
             </span>
             <span class="log-body">
-              <em>{{ l.action }}</em>
-              {{ l.content }}
+              <em>{{ actionText(l) }}</em>
+              {{ contentText(l) }}
             </span>
           </div>
         </div>
 
         <div class="pager">
-          <button class="btn sm line" :disabled="logPage <= 1 || logLoading" @click="prevLogPage">上一页</button>
-          <span class="muted">第 {{ logPage }} 页 · 共 {{ logTotal }} 条</span>
-          <button class="btn sm line" :disabled="!logHasMore || logLoading" @click="nextLogPage">下一页</button>
+          <button class="btn sm line" :disabled="logPage <= 1 || logLoading" @click="prevLogPage">{{ t('common.prevPage') }}</button>
+          <span class="muted">{{ t('service.logs.pageInfo', { page: logPage, total: logTotal }) }}</span>
+          <button class="btn sm line" :disabled="!logHasMore || logLoading" @click="nextLogPage">{{ t('common.nextPage') }}</button>
         </div>
       </div>
     </div>
@@ -937,28 +991,28 @@ onUnmounted(() => {
     <div class="overlay" :class="{ show: swOpen }" @click.self="closeSwitcher">
       <div class="sheet sheet--llm">
         <div class="sheet-head">
-          <h3>切换大模型</h3>
-          <button class="close-x" aria-label="关闭" title="关闭" :disabled="swSwitching" @click="closeSwitcher">
+          <h3>{{ t('service.llm.switch') }}</h3>
+          <button class="close-x" :aria-label="t('common.close')" :title="t('common.close')" :disabled="swSwitching" @click="closeSwitcher">
             <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
 
         <div class="sw-cur">
           <div class="sw-cur-main">
-            <div class="sw-cur-l">当前模型</div>
+            <div class="sw-cur-l">{{ t('service.llm.currentModel') }}</div>
             <div class="sw-cur-v">{{ swCurText }}</div>
             <div class="sw-file">{{ llmSourceText }}</div>
           </div>
           <button class="btn sm line" :disabled="swRefreshing" @click="refreshCatalog">
-            {{ swRefreshing ? '刷新中…' : '刷新目录' }}
+            {{ swRefreshing ? t('common.refreshing') : t('service.llm.refreshCatalog') }}
           </button>
         </div>
 
         <div class="log-search">
-          <input v-model="swKeyword" class="input" placeholder="搜索模型名称 / key / 提供商…" />
+          <input v-model="swKeyword" class="input" :placeholder="t('service.llm.searchModels')" />
         </div>
         <div class="tabs3">
-          <div class="tab3" :class="{ on: swProvider === '' }" @click="swProvider = ''">全部</div>
+          <div class="tab3" :class="{ on: swProvider === '' }" @click="swProvider = ''">{{ t('common.all') }}</div>
           <div
             v-for="p in swProviders" :key="p"
             class="tab3" :class="{ on: swProvider === p }"
@@ -967,7 +1021,7 @@ onUnmounted(() => {
         </div>
 
         <div v-if="llmGroups.length" class="sw-grp">
-          <span class="sw-grp-l">模型分组</span>
+          <span class="sw-grp-l">{{ t('service.llm.groups') }}</span>
           <span
             v-for="g in llmGroups" :key="g"
             class="grp-chip" :class="{ on: swSelected === g }"
@@ -976,9 +1030,9 @@ onUnmounted(() => {
         </div>
 
         <div class="log-scroll sw-list">
-          <div v-if="llmLoading && !llmModels.length" class="center muted" style="padding: 20px 0">模型加载中…</div>
+          <div v-if="llmLoading && !llmModels.length" class="center muted" style="padding: 20px 0">{{ t('service.llm.modelsLoading') }}</div>
           <div v-else-if="!swModels.length" class="center muted" style="padding: 20px 0">
-            {{ swAllHidden ? '暂无已配置的大模型（MiMoCode 内置的 mimo / xiaomi 默认项已隐藏），请先「新增大模型」' : '无匹配的模型' }}
+            {{ swAllHidden ? t('service.llm.noneConfigured') : t('service.llm.noMatch') }}
           </div>
           <label
             v-for="m in swModels" :key="m.key"
@@ -995,38 +1049,38 @@ onUnmounted(() => {
                 <em class="sw-item-key">{{ m.key }}</em>
               </span>
               <span class="sw-item-meta">
-                窗口 {{ fmtTokens(m.context) }} · 输出 {{ fmtTokens(m.output) }} · 计费 {{ m.cost?.input }}/{{ m.cost?.output }}
+                {{ t('service.llm.itemMeta', { ctx: fmtTokens(m.context), out: fmtTokens(m.output), ci: m.cost?.input ?? '', co: m.cost?.output ?? '' }) }}
               </span>
             </span>
             <span class="sw-tags">
-              <span v-if="m.isFavorite" class="mini-tag fav" title="收藏">★</span>
-              <span v-if="m.key === activeKey" class="mini-tag cur">当前</span>
-              <span v-else-if="m.isRecent" class="mini-tag">最近</span>
+              <span v-if="m.isFavorite" class="mini-tag fav" :title="t('service.llm.favorite')">★</span>
+              <span v-if="m.key === activeKey" class="mini-tag cur">{{ t('service.llm.tagCurrent') }}</span>
+              <span v-else-if="m.isRecent" class="mini-tag">{{ t('service.llm.tagRecent') }}</span>
             </span>
           </label>
         </div>
 
         <div class="sw-detail">
           <template v-if="swSelectedModel">
-            <div class="sw-detail-row"><span>接口地址</span><em>{{ swSelectedModel.api?.url || '—' }}</em></div>
-            <div class="sw-detail-row"><span>适配器</span><em>{{ swSelectedModel.api?.npm || '—' }}</em></div>
-            <div class="sw-detail-row"><span>变体</span><em>{{ (swSelectedModel.variants || []).join(' / ') || '—' }}</em></div>
+            <div class="sw-detail-row"><span>{{ t('service.llm.apiUrl') }}</span><em>{{ swSelectedModel.api?.url || '—' }}</em></div>
+            <div class="sw-detail-row"><span>{{ t('service.llm.adapter') }}</span><em>{{ swSelectedModel.api?.npm || '—' }}</em></div>
+            <div class="sw-detail-row"><span>{{ t('service.llm.variants') }}</span><em>{{ (swSelectedModel.variants || []).join(' / ') || '—' }}</em></div>
           </template>
           <div v-else-if="swIsGroup" class="sw-detail-row">
-            <span>模型分组</span><em>{{ swSelected }}（按配置 model_groups 解析）</em>
+            <span>{{ t('service.llm.groups') }}</span><em>{{ t('service.llm.groupValue', { g: swSelected }) }}</em>
           </div>
-          <div v-else class="sw-detail-row"><span>提示</span><em>请选择要切换的模型</em></div>
+          <div v-else class="sw-detail-row"><span>{{ t('service.llm.hint') }}</span><em>{{ t('service.llm.pickModel') }}</em></div>
         </div>
 
         <div v-if="swError" class="llm-warn">{{ swError }}</div>
 
         <div class="sw-foot">
-          <button class="btn line" :disabled="swSwitching" @click="closeSwitcher">取消</button>
+          <button class="btn line" :disabled="swSwitching" @click="closeSwitcher">{{ t('common.cancel') }}</button>
           <button class="btn primary" :disabled="!swCanConfirm" @click="confirmSwitch">
-            {{ swSwitching ? '切换中…' : swCanConfirm ? `切换到 ${swSelectedModel?.name || swSelected}` : (swSelected ? '与当前相同' : '请选择模型') }}
+            {{ swSwitching ? t('service.llm.switching') : swCanConfirm ? t('service.llm.switchTo', { name: swSelectedModel?.name || swSelected }) : (swSelected ? t('service.llm.sameAsCurrent') : t('service.llm.selectModel')) }}
           </button>
         </div>
-        <div class="sw-note">切换写回 mimocode 配置的顶层 model；新会话生效，已运行的 MiMoCode 需重新选择或重启。</div>
+        <div class="sw-note">{{ t('service.llm.switchNote') }}</div>
       </div>
     </div>
 
@@ -1034,35 +1088,35 @@ onUnmounted(() => {
     <div class="overlay" :class="{ show: adOpen }" @click.self="closeAdder">
       <div class="sheet sheet--add">
         <div class="sheet-head">
-          <h3>新增大模型</h3>
-          <button class="close-x" aria-label="关闭" title="关闭" :disabled="adSaving" @click="closeAdder">
+          <h3>{{ t('service.llm.add') }}</h3>
+          <button class="close-x" :aria-label="t('common.close')" :title="t('common.close')" :disabled="adSaving" @click="closeAdder">
             <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
 
         <!-- 已接入：目录 provider 只读（内置默认 mimo/xiaomi 已去掉），自定义 provider 可删 -->
         <div v-if="adExistCatalog.length || adCustom.length" class="ad-exist">
-          <span class="ad-lab">已接入</span>
+          <span class="ad-lab">{{ t('service.llm.connected') }}</span>
           <span v-for="p in adExistCatalog" :key="'c' + p" class="ad-chip">{{ p }}</span>
           <span v-for="p in adCustom" :key="'u' + p.id" class="ad-chip own">
-            {{ p.id }}<em>{{ p.modelCount }} 模型</em>
+            {{ p.id }}<em>{{ t('service.llm.modelCount', { n: p.modelCount ?? '' }) }}</em>
             <button
               class="ad-del" :class="{ arm: adConfirmDel === p.id }" :disabled="adSaving"
-              :title="adConfirmDel === p.id ? `再次点击确认删除 ${p.id}` : `删除 ${p.id}`"
+              :title="adConfirmDel === p.id ? t('service.llm.deleteConfirm', { id: p.id }) : t('service.llm.deleteNamed', { id: p.id })"
               @click.stop="onDelClick(p.id)"
-            >{{ adConfirmDel === p.id ? '确认' : '×' }}</button>
+            >{{ adConfirmDel === p.id ? t('common.confirm') : '×' }}</button>
           </span>
         </div>
 
         <div class="ad-sec">
-          <span class="ad-lab">厂商预设（点击带出，均可改）</span>
+          <span class="ad-lab">{{ t('service.llm.presetsLabel') }}</span>
           <div class="ad-presets">
             <button
               v-for="p in adPresets" :key="p.id"
               class="ad-preset" :class="{ on: adPresetId === p.id }"
               :disabled="adSaving" type="button" @click="applyPreset(p)"
             >
-              <b>{{ p.label }}</b>
+              <b>{{ presetText(p) }}</b>
             </button>
           </div>
         </div>
@@ -1070,36 +1124,32 @@ onUnmounted(() => {
         <div class="log-scroll ad-form">
           <label class="ad-field">
             <span>Provider ID</span>
-            <input v-model="adForm.providerId" class="input" :disabled="adSaving" placeholder="小写字母/数字/中划线，如 deepseek" />
-            <em v-if="adIsCatalog" class="ad-hint">
-              「{{ adForm.providerId.trim() }}」是内置目录 provider：其既有模型
-              {{ adCatalogModels.slice(0, 4).join('、') }}{{ adCatalogModels.length > 4 ? ' 等' : '' }}
-              会一并并入配置保留，并与新模型共用下方 baseURL。
-            </em>
+            <input v-model="adForm.providerId" class="input" :disabled="adSaving" :placeholder="t('service.llm.providerIdPlaceholder')" />
+            <em v-if="adIsCatalog" class="ad-hint">{{ adCatalogHint }}</em>
           </label>
           <div class="ad-grid">
             <label class="ad-field">
-              <span>显示名称</span>
+              <span>{{ t('service.llm.fieldName') }}</span>
               <input v-model="adForm.name" class="input" :disabled="adSaving" placeholder="DeepSeek" />
             </label>
             <label class="ad-field">
-              <span>适配器</span>
+              <span>{{ t('service.llm.adapter') }}</span>
               <select v-model="adForm.npm" class="input ad-select" :disabled="adSaving">
-                <option v-for="a in adAdapters" :key="a.npm" :value="a.npm">{{ a.label }}</option>
+                <option v-for="a in adAdapters" :key="a.npm" :value="a.npm">{{ adapterText(a) }}</option>
               </select>
             </label>
           </div>
           <label class="ad-field">
-            <span>接口地址 baseURL</span>
+            <span>{{ t('service.llm.fieldBaseUrl') }}</span>
             <input v-model="adForm.baseURL" class="input" :disabled="adSaving" placeholder="https://api.deepseek.com/v1" />
           </label>
           <div class="ad-grid">
             <label class="ad-field">
-              <span>模型 ID</span>
+              <span>{{ t('service.llm.fieldModelId') }}</span>
               <input v-model="adForm.modelId" class="input" :disabled="adSaving" placeholder="deepseek-chat" />
             </label>
             <label class="ad-field">
-              <span>模型显示名</span>
+              <span>{{ t('service.llm.fieldModelName') }}</span>
               <input v-model="adForm.modelName" class="input" :disabled="adSaving" placeholder="DeepSeek Chat" />
             </label>
           </div>
@@ -1111,50 +1161,46 @@ onUnmounted(() => {
                 :type="adShowKey ? 'text' : 'password'"
                 :disabled="adSaving"
                 :placeholder="adIsFamily
-                  ? '留空走登录凭据（auth）；或填 sk-… / {env:MY_KEY}'
-                  : 'sk-… 或 {env:MY_KEY}；本地端点可留空'"
+                  ? t('service.llm.keyPlaceholderFamily')
+                  : t('service.llm.keyPlaceholderLocal')"
               />
               <button class="ad-eye" type="button" @click="adShowKey = !adShowKey">
-                {{ adShowKey ? '隐藏' : '显示' }}
+                {{ adShowKey ? t('service.hide') : t('service.show') }}
               </button>
             </div>
             <em v-if="adIsFamily" class="ad-hint">{{
               adAuthReady
-                ? '已检测到 MiMo 登录凭据：API Key 可留空，提交后自动走 auth 登录连接（挂 xiaomi、端点切登录网关，不写明文 key）。'
-                : 'API Key 可留空，但需先在 MiMoCode 执行 mimo auth login 完成登录；否则请填写 API Key。'
+                ? t('service.llm.authHintReady')
+                : t('service.llm.authHintLogin')
             }}</em>
           </label>
           <div class="ad-cap">
-            <span class="ad-cap-title">能力标定（按模型实际能力勾选，写入 mimocode 配置）</span>
+            <span class="ad-cap-title">{{ t('service.llm.capTitle') }}</span>
             <div class="ad-cap-grid">
-              <label class="ad-check"><input v-model="adForm.caps.reasoning" type="checkbox" :disabled="adSaving" /><span>推理</span></label>
-              <label class="ad-check"><input v-model="adForm.caps.tool_call" type="checkbox" :disabled="adSaving" /><span>工具调用</span></label>
-              <label class="ad-check"><input v-model="adForm.caps.attachment" type="checkbox" :disabled="adSaving" /><span>附件</span></label>
-              <label class="ad-check"><input v-model="adForm.caps.image" type="checkbox" :disabled="adSaving" /><span>图像输入</span></label>
-              <label class="ad-check"><input v-model="adForm.caps.audio" type="checkbox" :disabled="adSaving" /><span>音频输入</span></label>
-              <label class="ad-check"><input v-model="adForm.caps.video" type="checkbox" :disabled="adSaving" /><span>视频输入</span></label>
+              <label class="ad-check"><input v-model="adForm.caps.reasoning" type="checkbox" :disabled="adSaving" /><span>{{ t('llm.cap.reasoning') }}</span></label>
+              <label class="ad-check"><input v-model="adForm.caps.tool_call" type="checkbox" :disabled="adSaving" /><span>{{ t('llm.cap.toolcall') }}</span></label>
+              <label class="ad-check"><input v-model="adForm.caps.attachment" type="checkbox" :disabled="adSaving" /><span>{{ t('llm.cap.attachment') }}</span></label>
+              <label class="ad-check"><input v-model="adForm.caps.image" type="checkbox" :disabled="adSaving" /><span>{{ t('llm.cap.image') }}</span></label>
+              <label class="ad-check"><input v-model="adForm.caps.audio" type="checkbox" :disabled="adSaving" /><span>{{ t('llm.cap.audio') }}</span></label>
+              <label class="ad-check"><input v-model="adForm.caps.video" type="checkbox" :disabled="adSaving" /><span>{{ t('llm.cap.video') }}</span></label>
             </div>
-            <em class="ad-hint">6 项均必选（勾/不勾都写入配置）：不勾的能力会在 mimocode 中显式声明为不支持，MiMoCode 将按此拦截相应输入。</em>
+            <em class="ad-hint">{{ t('service.llm.capHint') }}</em>
           </div>
           <label class="ad-check">
             <input v-model="adForm.setAsCurrent" type="checkbox" :disabled="adSaving" />
-            <span>添加后设为当前模型（写入顶层 model 并置入 recent）</span>
+            <span>{{ t('service.llm.setAsCurrent') }}</span>
           </label>
         </div>
 
         <div v-if="adError" class="llm-warn">{{ adError }}</div>
 
         <div class="sw-foot">
-          <button class="btn line" :disabled="adSaving" @click="closeAdder">取消</button>
+          <button class="btn line" :disabled="adSaving" @click="closeAdder">{{ t('common.cancel') }}</button>
           <button class="btn primary" :disabled="!adCanSubmit" @click="submitAdd">
-            {{ adSaving ? '添加中…' : '添加' }}
+            {{ adSaving ? t('service.llm.adding') : t('service.llm.addSubmit') }}
           </button>
         </div>
-        <div class="sw-note">
-          预设 baseURL 为厂商公开端点、模型 ID 为可编辑示例（以厂商文档为准）；密钥明文写入 mimocode 配置，
-          也可用 <b>{env:VAR}</b> 引用环境变量。写回后新会话生效。xiaomi/mimo 系留空密钥可走
-          <b>auth 登录连接</b>（自动挂 xiaomi、端点切登录网关）。
-        </div>
+        <div class="sw-note">{{ t('service.llm.addNoteA') }}<b>{{ t('service.llm.addNoteB') }}</b>{{ t('service.llm.addNoteC') }}<b>{{ t('service.llm.addNoteD') }}</b>{{ t('service.llm.addNoteE') }}</div>
       </div>
     </div>
 
@@ -1162,69 +1208,69 @@ onUnmounted(() => {
     <div class="overlay" :class="{ show: pwdOpen }" @click.self="closePwd">
       <div class="sheet sheet--pwd">
         <div class="sheet-head">
-          <h3>修改密码</h3>
-          <button class="close-x" aria-label="关闭" title="关闭" :disabled="pwdSaving" @click="closePwd">
+          <h3>{{ t('service.changePwd.title') }}</h3>
+          <button class="close-x" :aria-label="t('common.close')" :title="t('common.close')" :disabled="pwdSaving" @click="closePwd">
             <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
 
         <div class="pwd-form">
           <label class="ad-field">
-            <span>当前密码</span>
+            <span>{{ t('service.pwd.current') }}</span>
             <div class="ad-key">
               <input
                 v-model="pwdForm.current" class="input"
                 :type="pwdShow.current ? 'text' : 'password'"
                 :disabled="pwdSaving" autocomplete="current-password"
-                placeholder="请输入当前登录密码"
+                :placeholder="t('service.pwd.currentPlaceholder')"
               />
               <button class="ad-eye" type="button" @click="pwdShow.current = !pwdShow.current">
-                {{ pwdShow.current ? '隐藏' : '显示' }}
+                {{ pwdShow.current ? t('service.hide') : t('service.show') }}
               </button>
             </div>
           </label>
 
           <label class="ad-field">
-            <span>新密码</span>
+            <span>{{ t('service.pwd.next') }}</span>
             <div class="ad-key">
               <input
                 v-model="pwdForm.next" class="input"
                 :type="pwdShow.next ? 'text' : 'password'"
                 :disabled="pwdSaving" autocomplete="new-password"
-                :placeholder="`至少 ${PWD_MIN_LEN} 位`"
+                :placeholder="t('service.pwd.minLen', { n: PWD_MIN_LEN })"
               />
               <button class="ad-eye" type="button" @click="pwdShow.next = !pwdShow.next">
-                {{ pwdShow.next ? '隐藏' : '显示' }}
+                {{ pwdShow.next ? t('service.hide') : t('service.show') }}
               </button>
             </div>
           </label>
 
           <label class="ad-field">
-            <span>确认新密码</span>
+            <span>{{ t('service.pwd.confirm') }}</span>
             <div class="ad-key">
               <input
                 v-model="pwdForm.confirm" class="input"
                 :type="pwdShow.confirm ? 'text' : 'password'"
                 :disabled="pwdSaving" autocomplete="new-password"
-                placeholder="请再次输入新密码"
+                :placeholder="t('service.pwd.confirmPlaceholder')"
                 @keydown.enter="submitPwd"
               />
               <button class="ad-eye" type="button" @click="pwdShow.confirm = !pwdShow.confirm">
-                {{ pwdShow.confirm ? '隐藏' : '显示' }}
+                {{ pwdShow.confirm ? t('service.hide') : t('service.show') }}
               </button>
             </div>
-            <em v-if="pwdMismatch" class="pwd-err">两次输入的新密码不一致</em>
+            <em v-if="pwdMismatch" class="pwd-err">{{ t('error.PASSWORD_MISMATCH') }}</em>
           </label>
 
-          <em class="pwd-hint">新密码至少 {{ PWD_MIN_LEN }} 位，且不能与当前密码相同；修改成功后请使用新密码登录。</em>
+          <em class="pwd-hint">{{ t('service.pwd.hint', { n: PWD_MIN_LEN }) }}</em>
         </div>
 
         <div v-if="pwdError" class="llm-warn">{{ pwdError }}</div>
 
         <div class="sw-foot">
-          <button class="btn line" :disabled="pwdSaving" @click="closePwd">取消</button>
+          <button class="btn line" :disabled="pwdSaving" @click="closePwd">{{ t('common.cancel') }}</button>
           <button class="btn primary" :disabled="!pwdCanSubmit" @click="submitPwd">
-            {{ pwdSaving ? '提交中…' : '确认修改' }}
+            {{ pwdSaving ? t('service.changePwd.submitting') : t('service.changePwd.confirmBtn') }}
           </button>
         </div>
       </div>
@@ -1234,36 +1280,36 @@ onUnmounted(() => {
     <div class="overlay" :class="{ show: aboutOpen }" @click.self="closeAbout">
       <div class="sheet sheet--about">
         <div class="sheet-head">
-          <h3>关于软件信息</h3>
-          <button class="close-x" aria-label="关闭" title="关闭" @click="closeAbout">
+          <h3>{{ t('service.about.title') }}</h3>
+          <button class="close-x" :aria-label="t('common.close')" :title="t('common.close')" @click="closeAbout">
             <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
         </div>
 
         <div class="about-body">
-          <div class="about-sec">软件信息</div>
-          <div class="kv"><span class="k">软件作者</span><span class="v">{{ ABOUT_AUTHOR.author }}</span></div>
-          <div class="kv"><span class="k">抖音账号</span><span class="v">{{ ABOUT_AUTHOR.douyin }}</span></div>
-          <div class="kv"><span class="k">b站账号</span><span class="v">{{ ABOUT_AUTHOR.bilibili }}</span></div>
+          <div class="about-sec">{{ t('service.about.sectionSoftware') }}</div>
+          <div class="kv"><span class="k">{{ t('service.about.softwareAuthor') }}</span><span class="v">{{ ABOUT_AUTHOR.author }}</span></div>
+          <div class="kv"><span class="k">{{ t('service.about.douyin') }}</span><span class="v">{{ ABOUT_AUTHOR.douyin }}</span></div>
+          <div class="kv"><span class="k">{{ t('service.about.bilibili') }}</span><span class="v">{{ ABOUT_AUTHOR.bilibili }}</span></div>
 
-          <div class="about-sec">开源仓库</div>
-          <div class="kv"><span class="k">仓库名称</span><span class="v">{{ ABOUT_REPO.name }}</span></div>
+          <div class="about-sec">{{ t('service.about.sectionRepo') }}</div>
+          <div class="kv"><span class="k">{{ t('service.about.repoName') }}</span><span class="v">{{ ABOUT_REPO.name }}</span></div>
           <div class="kv">
-            <span class="k">仓库地址</span>
+            <span class="k">{{ t('service.about.repoUrl') }}</span>
             <a class="v about-link" :href="ABOUT_REPO.url" target="_blank" rel="noopener">{{ ABOUT_REPO.url }}</a>
           </div>
-          <div class="kv"><span class="k">SSH 地址</span><span class="v">{{ ABOUT_REPO.ssh }}</span></div>
-          <div class="kv"><span class="k">开源协议</span><span class="v">{{ ABOUT_REPO.license }}</span></div>
-          <div class="kv"><span class="k">当前分支</span><span class="v">{{ ABOUT_REPO.branch }}</span></div>
+          <div class="kv"><span class="k">{{ t('service.about.ssh') }}</span><span class="v">{{ ABOUT_REPO.ssh }}</span></div>
+          <div class="kv"><span class="k">{{ t('service.about.license') }}</span><span class="v">{{ ABOUT_REPO.license }}</span></div>
+          <div class="kv"><span class="k">{{ t('service.about.branch') }}</span><span class="v">{{ ABOUT_REPO.branch }}</span></div>
 
-          <div class="about-sec">打包信息<span class="about-sec-src">来源：任务 84</span></div>
+          <div class="about-sec">{{ t('service.about.sectionPkg') }}<span class="about-sec-src">{{ t('service.about.pkgSource') }}</span></div>
           <div v-for="row in ABOUT_PKG" :key="row.k" class="kv">
             <span class="k">{{ row.k }}</span><span class="v">{{ row.v }}</span>
           </div>
         </div>
 
         <div class="sw-foot">
-          <button class="btn line" @click="closeAbout">关闭</button>
+          <button class="btn line" @click="closeAbout">{{ t('common.close') }}</button>
         </div>
       </div>
     </div>
@@ -1372,6 +1418,18 @@ onUnmounted(() => {
 /* ===== 操作按钮行 ===== */
 .conn { display: flex; gap: 8px; margin-top: 14px }
 .conn .btn { flex: 1; justify-content: center }
+
+/* ===== 语言切换行（状态卡下方单选；375px 宽度内两枚胶囊不溢出） ===== */
+.lang-row { display: flex; align-items: center; justify-content: space-between; gap: 10px }
+.lang-label { font-size: 12.5px; color: var(--t3); flex-shrink: 0 }
+.lang-opts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; min-width: 0 }
+.lang-opt {
+  padding: 6px 12px; border-radius: 20px; border: 1px solid var(--line);
+  background: var(--card2); color: var(--t3); font-size: 12px; font-weight: 600;
+  cursor: pointer; transition: 0.2s; font-family: inherit; white-space: nowrap;
+}
+.lang-opt:active { transform: scale(0.97) }
+.lang-opt.on { background: rgba(59, 130, 246, 0.16); border-color: var(--blue); color: var(--blue) }
 
 /* ===== misc ===== */
 .center { text-align: center }
