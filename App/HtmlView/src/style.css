@@ -54,6 +54,22 @@ body {
   margin: 0;
 }
 
+/* ===== 页面滚动条隐藏（全局，第 7 轮） =====
+   覆盖页面所有滚动容器 —— 首页内容区 .content、各弹窗 .sheet、
+   分类 tab 条、下拉框 select 及其选项弹层(listbox)等 —— 的滚动条：
+   - scrollbar-width: none  标准属性（Firefox / Chromium 滚动容器与列表框）
+   -::-webkit-scrollbar      WebKit/Blink 滚动条绘制层（含 select 弹层）
+   注意：仅隐藏视觉滚动条，overflow 滚动行为本身不受影响。 */
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+*::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+  display: none !important;
+}
+
 h1,
 h2 {
   font-family: var(--heading);

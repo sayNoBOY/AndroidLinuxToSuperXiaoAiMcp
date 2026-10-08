@@ -7,7 +7,7 @@ import {
   getLlmInfo, switchLlmModel, addLlmProvider, removeLlmProvider,
 } from '../api/system.js'
 import { changePassword } from '../api/auth.js'
-import { t, tExists, errText, locale, setLocale, LOCALES } from '../i18n/index.js'
+import { t, tExists, errText, tBackend, locale, setLocale, LOCALES } from '../i18n/index.js'
 import { fmtUptime } from '../i18n/date.js'
 
 // 依据 随身互联App四Tab原型(6).html Tab4「我的」实现，接口对接 SysApi.js：
@@ -53,6 +53,13 @@ function toast(msg) {
 // ---------- 展示辅助 ----------
 const STATE_CLS = { running: 'green', restarting: 'yellow', stopped: 'red' }
 const stateCls = computed(() => STATE_CLS[status.value?.state] || 'gray')
+/** 状态文案：优先按机器码 state 本地化（zh 与后端 STATE_TEXT 逐字一致）；未知码回退服务端原文 */
+const srvStateText = computed(() => {
+  const s = status.value
+  if (!s) return t('service.connecting')
+  const key = `service.state.${s.state}`
+  return tExists(key) ? t(key) : s.stateText || t('service.connecting')
+})
 
 const cpuText = computed(() => {
   const c = metrics.value?.cpu
@@ -69,6 +76,8 @@ const diskText = computed(() => {
 
 // 当前服务访问地址：本页前端实际访问的 origin（hash 路由不计入地址，局域网/localhost 随打开方式变化）
 const frontendAddr = window.location.origin || '—'
+// MCP 服务地址：后端 http-server.js 监听 3000 的 /mcp 端点（与 auth.js 同口径取 host）
+const mcpAddr = `http://${window.location.hostname || 'localhost'}:3000/mcp`
 
 // 进度条配色随水位变化（演示值 32/68/45 对应 绿/黄/绿，与原型一致）
 function barColor(p) {
@@ -662,7 +671,7 @@ async function submitPwd() {
 // ---------- 关于软件信息弹窗 ----------
 // 作者/社交账号按用户要求固定展示；开源仓库取自本仓库 git remote（gitee）；
 // 打包信息取自任务 84「重打包」的最终构建产物（智衍 SelfEvolution APK，实测 se9，
-// 展示版本按要求 +1 至 se10）。
+// 展示版本按要求改为 se12）。
 const aboutOpen = ref(false)
 
 const ABOUT_AUTHOR = Object.freeze({
@@ -680,14 +689,14 @@ const ABOUT_REPO = Object.freeze({
 })
 
 // 任务 84（taskRes/84/打包验证记录.txt + 任务报告.md）：se9 APK 用 aapt2/apksigner 实测
-// （versionCode 20261002 · 212,105,792 B · 同证书 d2df32db…），版本号按要求 +1 → se10。
+// （versionCode 20261002 · 212,105,792 B · 同证书 d2df32db…），展示版本按要求改为 se12。
 // 值为固定展示数据不翻译（zh/en 同文）：含中文的值放语言包仅为硬编码扫描归零；
 // label 走 service.about.*，computed 包裹保证切语言即时重算。
 const ABOUT_PKG = computed(() => [
   { k: t('service.about.pkgTask'), v: t('service.about.pkgTaskValue') },
   { k: t('service.about.appName'), v: t('service.about.appNameValue') },
   { k: t('service.about.pkgName'), v: 'com.termux' },
-  { k: t('service.about.version'), v: 'versionName 0.118.0-se10 · versionCode 20261002' },
+  { k: t('service.about.version'), v: 'versionName 0.118.0-se12 · versionCode 20261002' },
   { k: t('service.about.apk'), v: t('service.about.apkValue') },
   { k: t('service.about.signing'), v: 'CN=SelfEvolution, OU=SE, O=SelfEvolution, C=CN' },
   { k: t('service.about.sdk'), v: 'minSdk 21 · targetSdk 28 · compileSdk 36' },
@@ -754,10 +763,10 @@ onUnmounted(() => {
             </svg>
           </div>
           <div class="srv-main">
-            <div class="srv-name">{{ status?.name || t('service.serverName') }}</div>
+            <div class="srv-name">{{ tBackend('service.serverName', status?.name) }}</div>
             <div class="srv-state-row">
               <span class="dot" :class="'bg-' + stateCls" :style="rebooting ? '' : 'animation: breath 1.6s infinite'"></span>
-              <span class="srv-state" :class="stateCls">{{ status?.stateText || t('service.connecting') }}</span>
+              <span class="srv-state" :class="stateCls">{{ srvStateText }}</span>
             </div>
           </div>
           <div class="srv-up">
@@ -772,6 +781,7 @@ onUnmounted(() => {
           <span class="v">{{ status ? t('service.field.coresValue', { cores: status.cpuCores, model: status.cpuModel }) : '—' }}</span>
         </div>
         <div class="kv"><span class="k">{{ t('service.field.accessAddress') }}</span><span class="v">{{ frontendAddr }}</span></div>
+        <div class="kv"><span class="k">{{ t('service.field.mcpAddress') }}</span><span class="v">{{ mcpAddr }}</span></div>
       </div>
 
       <!-- CPU / 内存 / 磁盘 -->

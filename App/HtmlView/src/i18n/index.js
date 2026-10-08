@@ -84,6 +84,18 @@ export function errText(e, fallbackKey) {
   return e?.message || t('error.UNKNOWN')
 }
 
+/**
+ * 后端下发的展示文案 → 当前语言（服务名等「默认值可翻译、自定义值不译」场景）
+ * - 无值 → 直接用 key（服务未就绪时的占位）
+ * - 值 === zh 源语言默认值（如 SYS_NAME 未设时后端下发的「随身互联服务器」）→ 按 key 翻译
+ * - 其它（用户通过 SYS_NAME 等自定义的值）→ 原样展示，绝不翻译
+ */
+export function tBackend(key, raw) {
+  if (raw === undefined || raw === null || raw === '') return t(key)
+  if (zhCN[key] !== undefined && raw === zhCN[key]) return t(key)
+  return raw
+}
+
 /** 切换语言：持久化 + <html lang> + 文档标题；locale 是 ref，UI 自动重渲染 */
 export function setLocale(next) {
   if (!CATALOGS[next] || next === locale.value) return
