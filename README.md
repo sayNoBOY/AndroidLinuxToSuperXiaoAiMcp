@@ -71,15 +71,15 @@ MCP Streamable HTTP server running at http://0.0.0.0:3000/mcp
 | 名称 | 随意(如 `node`) |
 | 地址 | `http://<本机IP>:3000/mcp` |
 
-## 工具列表(共 4 个)
+## 工具列表(共 1 个)
 
-`run_command`、`get_find_file`、`ask_mimocode`、`video_upload`
+`ask_mimocode`
 
 详细的工具说明、传输层协议细节与接入步骤见 **[McpServer/README.md](McpServer/README.md)**。
 
 ## ⚠ 安全提示
 
-服务器绑定 `0.0.0.0` 且**没有任何鉴权**,局域网内任何人只要知道 IP 就能调用 `run_command`、`ask_mimocode`、`get_find_file` 等高危工具。请仅在可信网络环境下运行,或自行加防火墙/反向代理/令牌后暴露。
+服务器绑定 `0.0.0.0` 且**没有任何鉴权**,局域网内任何人只要知道 IP 就能调用 `ask_mimocode` 驱动本机 agent 执行任务。请仅在可信网络环境下运行,或自行加防火墙/反向代理/令牌后暴露。
 
 ## License
 

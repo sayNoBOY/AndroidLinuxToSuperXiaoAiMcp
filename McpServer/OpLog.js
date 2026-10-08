@@ -89,10 +89,7 @@ const ACTION_RULES = [
 
 // MCP 工具名 → 中文（tools/call 时识别；在此表内的为已知工具，key = mcp.tool.<name>）
 const MCP_TOOL_CN = {
-  run_command: "执行命令",
-  get_find_file: "查找文件",
   ask_mimocode: "咨询MiMoCode",
-  video_upload: "上传视频",
 };
 
 /** POST /mcp 动态识别：返回 {action（中文原文）, actionKey（稳定 key，未知为 null）} */
