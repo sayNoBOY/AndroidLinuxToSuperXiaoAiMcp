@@ -26,21 +26,43 @@ export function setEventSeq(seq) {
   if (typeof seq === 'number' && seq > lastSeq) lastSeq = seq
 }
 
-/** GET /tasks — 列表（含 stats + 分页 + server_seq 快照水位） */
-export function listTasks({ state, page, limit } = {}) {
+/** GET /tasks — 列表（含 stats + 分页 + server_seq 快照水位；categoryId 按分类过滤统计与列表） */
+export function listTasks({ state, page, limit, categoryId } = {}) {
   const qs = new URLSearchParams()
   if (state) qs.set('state', state)
   if (page) qs.set('page', page)
   if (limit) qs.set('limit', limit)
+  if (categoryId != null) qs.set('category_id', categoryId)
   const suffix = qs.toString() ? `?${qs}` : ''
   return api(`/tasks${suffix}`)
 }
 
-/** POST /tasks — 创建任务（创建 MiMoCode 会话；upload_batch 关联参考物） */
-export function createTask({ name, icon, message, upload_batch }) {
+/** POST /tasks — 创建任务（创建 MiMoCode 会话；upload_batch 关联参考物，category_id 归类） */
+export function createTask({ name, icon, message, upload_batch, category_id }) {
   const body = { name, icon, message }
   if (upload_batch) body.upload_batch = upload_batch
+  if (category_id != null) body.category_id = category_id
   return api('/tasks', { method: 'POST', body })
+}
+
+/** GET /task-categories — 任务分类列表（首页标题旁 tab，按创建顺序） */
+export function listCategories() {
+  return api('/task-categories')
+}
+
+/** POST /task-categories — 新增任务分类（服务端校验名称 ≤8 字符） */
+export function createCategory(name) {
+  return api('/task-categories', { method: 'POST', body: { name } })
+}
+
+/** DELETE /task-categories/{id} — 删除任务分类（分类下任务解除归类） */
+export function deleteCategory(categoryId) {
+  return api(`/task-categories/${categoryId}`, { method: 'DELETE' })
+}
+
+/** PUT /tasks/{id} — 更新任务分类（详情弹窗下拉切换；category_id null = 解除归类） */
+export function updateTaskCategory(taskId, categoryId) {
+  return api(`/tasks/${taskId}`, { method: 'PUT', body: { category_id: categoryId } })
 }
 
 /** GET /tasks/{id} — 详情 */

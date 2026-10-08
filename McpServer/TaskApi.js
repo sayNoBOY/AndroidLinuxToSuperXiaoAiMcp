@@ -2,6 +2,9 @@
  * 随身互联 — 任务管理接口（依据《任务管理接口文档-v2.md》实现）
  *
  *   GET    /api/v1/tasks               任务列表（含 stats + 分页，需 Bearer）
+ *   GET    /api/v1/task-categories     任务分类列表（首页 tab，需 Bearer）
+ *   POST   /api/v1/task-categories     新增任务分类（名称 ≤8 字符，需 Bearer）
+ *   DELETE /api/v1/task-categories/{id} 删除任务分类（分类下任务解除归类，需 Bearer）
  *   POST   /api/v1/uploads             参考物分步上传（multipart/form-data，需 Bearer）
  *           ≤5 个/次、≤50MB/个、≤100MB/总量；手写有界解析（express.raw 先卡 110mb）。
  *           文件暂存 taskRes/.staging/<batch_id>/（隐藏目录不入产物扫描），
@@ -9,6 +12,7 @@
  *   POST   /api/v1/tasks               创建任务 = 创建 MiMoCode 会话（需 Bearer，
  *                                       可携 upload_batch 关联参考物）
  *   GET    /api/v1/tasks/{task_id}     任务详情（需 Bearer）
+ *   PUT    /api/v1/tasks/{task_id}     更新任务分类（body {category_id}，null=解除归类，需 Bearer）
  *   POST   /api/v1/tasks/{task_id}/send  发送新消息（202 受理；运行中自动排队，
  *                                        当前轮结束后按序续跑 —— 多轮会话，
  *                                        可携 upload_batch 关联参考物）
@@ -247,6 +251,14 @@ function ensureTaskTables() {
       created_at TEXT DEFAULT (datetime('now', 'localtime'))
     );
 
+    CREATE TABLE IF NOT EXISTS task_categories (
+      category_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now', 'localtime')),
+      FOREIGN KEY (user_id) REFERENCES users(user_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_user_state ON tasks(user_id, state);
     CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
     CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(user_id, created_at DESC);
@@ -259,7 +271,8 @@ function ensureTaskTables() {
   // pending = send 排队标记（1 = 已受理未派发给 mimo）；
   // attachments = 该条消息携带的参考物 JSON [{filename,size}]；
   // updated_at = 任务最近活动时间（send/派发/完成/取消时刷新，列表按它排序）
-  ensureColumns("tasks", { cwd: "TEXT", model: "TEXT", updated_at: "TEXT" });
+  // category_id = 任务分类（task_categories.category_id，NULL = 未分类）
+  ensureColumns("tasks", { cwd: "TEXT", model: "TEXT", updated_at: "TEXT", category_id: "INTEGER" });
   ensureColumns("task_messages", { pending: "INTEGER DEFAULT 0", attachments: "TEXT" });
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(user_id, updated_at DESC)"
@@ -413,6 +426,7 @@ function rowToApi(row, names, { detail = false } = {}) {
         : row.duration_sec ?? 0,
     source_device: deviceObj(row.source_device_id, names),
     target_device: deviceObj(row.target_device_id, names),
+    category_id: row.category_id ?? null,
     created_at: toISO(row.created_at),
     updated_at: toISO(row.updated_at ?? row.created_at),
   };
@@ -1532,20 +1546,90 @@ export function mountTaskApi(app) {
     }
   );
 
-  // GET /api/v1/tasks —— 列表（stats + 状态筛选 + 分页）
+  // GET /api/v1/task-categories —— 任务分类列表（按创建顺序，供首页 tab 渲染）
+  router.get("/task-categories", requireAuth, (req, res) => {
+    const rows = db
+      .prepare(
+        "SELECT category_id, name, created_at FROM task_categories WHERE user_id = ? ORDER BY category_id"
+      )
+      .all(req.user.user_id);
+    return ok(res, {
+      categories: rows.map((r) => ({
+        category_id: r.category_id,
+        name: r.name,
+        created_at: toISO(r.created_at),
+      })),
+    });
+  });
+
+  // POST /api/v1/task-categories —— 新增任务分类（名称 ≤8 字符，按码点计数）
+  router.post("/task-categories", requireAuth, (req, res) => {
+    const b = req.body ?? {};
+    if (typeof b.name !== "string" || !b.name.trim()) return badRequest(res, "name 为必填字段");
+    const name = b.name.trim();
+    if ([...name].length > 8) {
+      return fail(res, 400, "任务分类名称不能超过 8 个字符", "CATEGORY_NAME_TOO_LONG");
+    }
+    const dup = db
+      .prepare("SELECT 1 FROM task_categories WHERE user_id = ? AND name = ?")
+      .get(req.user.user_id, name);
+    if (dup) return fail(res, 409, "分类名称已存在", "CATEGORY_NAME_EXISTS");
+    const categoryId = Number(
+      db
+        .prepare("INSERT INTO task_categories (user_id, name) VALUES (?, ?)")
+        .run(req.user.user_id, name).lastInsertRowid
+    );
+    const row = db
+      .prepare("SELECT category_id, name, created_at FROM task_categories WHERE category_id = ?")
+      .get(categoryId);
+    return ok(res, { category_id: row.category_id, name: row.name, created_at: toISO(row.created_at) }, 201);
+  });
+
+  // DELETE /api/v1/task-categories/{category_id} —— 删除分类（分类下任务解除归类，不删任务）
+  router.delete("/task-categories/:categoryId", requireAuth, (req, res) => {
+    const categoryId = asInt(req.params.categoryId);
+    if (categoryId == null) return badRequest(res, "category_id 无效");
+    const owned = db
+      .prepare("SELECT 1 FROM task_categories WHERE category_id = ? AND user_id = ?")
+      .get(categoryId, req.user.user_id);
+    if (!owned) return fail(res, 404, "任务分类不存在", "CATEGORY_NOT_FOUND");
+    db.prepare("UPDATE tasks SET category_id = NULL WHERE category_id = ? AND user_id = ?").run(
+      categoryId,
+      req.user.user_id
+    );
+    db.prepare("DELETE FROM task_categories WHERE category_id = ? AND user_id = ?").run(
+      categoryId,
+      req.user.user_id
+    );
+    return ok(res, { category_id: categoryId, deleted: true });
+  });
+
+  // GET /api/v1/tasks —— 列表（stats + 状态筛选 + 分页 + 分类筛选）
   router.get("/tasks", requireAuth, (req, res) => {
     const userId = req.user.user_id;
     const state = req.query.state != null ? String(req.query.state) : null;
     if (state && !ALL_STATES.has(state)) {
       return badRequest(res, "state 取值无效：running/queued/completed/failed/cancelled");
     }
+    // category_id：选中分类时 stats 与列表按该分类统计/过滤；缺省 = 全部
+    let categoryId = null;
+    if (req.query.category_id != null && req.query.category_id !== "") {
+      categoryId = asInt(req.query.category_id);
+      if (categoryId == null) return badRequest(res, "category_id 须为整数");
+    }
     const page = Math.max(1, Math.floor(Number(req.query.page) || 1));
     const limit = Math.min(100, Math.max(1, Math.floor(Number(req.query.limit) || 20)));
     const offset = (page - 1) * limit;
 
+    const statConds = ["user_id = ?"];
+    const statArgs = [userId];
+    if (categoryId != null) {
+      statConds.push("category_id = ?");
+      statArgs.push(categoryId);
+    }
     const statRows = db
-      .prepare("SELECT state, COUNT(*) AS c FROM tasks WHERE user_id = ? GROUP BY state")
-      .all(userId);
+      .prepare(`SELECT state, COUNT(*) AS c FROM tasks WHERE ${statConds.join(" AND ")} GROUP BY state`)
+      .all(...statArgs);
     const byState = Object.fromEntries(statRows.map((r) => [r.state, r.c]));
     const stats = {
       running: byState.running ?? 0,
@@ -1554,8 +1638,17 @@ export function mountTaskApi(app) {
       failed: byState.failed ?? 0,
     };
 
-    const where = state ? "WHERE user_id = ? AND state = ?" : "WHERE user_id = ?";
-    const args = state ? [userId, state] : [userId];
+    const conds = ["user_id = ?"];
+    const args = [userId];
+    if (state) {
+      conds.push("state = ?");
+      args.push(state);
+    }
+    if (categoryId != null) {
+      conds.push("category_id = ?");
+      args.push(categoryId);
+    }
+    const where = `WHERE ${conds.join(" AND ")}`;
     const total = db.prepare(`SELECT COUNT(*) AS c FROM tasks ${where}`).get(...args).c;
     const rows = db
       .prepare(`SELECT * FROM tasks ${where} ORDER BY COALESCE(updated_at, created_at) DESC, task_id DESC LIMIT ? OFFSET ?`)
@@ -1623,14 +1716,25 @@ export function mountTaskApi(app) {
     const model = typeof b.model === "string" && b.model ? b.model : null;
     const uploadBatch =
       typeof b.upload_batch === "string" && b.upload_batch ? b.upload_batch : null;
+    // 任务分类（可选）：须为该用户已存在的分类
+    let categoryId = b.category_id == null || b.category_id === "" ? null : asInt(b.category_id);
+    if (b.category_id != null && b.category_id !== "" && categoryId == null) {
+      return badRequest(res, "category_id 须为整数");
+    }
+    if (categoryId != null) {
+      const owned = db
+        .prepare("SELECT 1 FROM task_categories WHERE category_id = ? AND user_id = ?")
+        .get(categoryId, req.user.user_id);
+      if (!owned) return fail(res, 400, "任务分类不存在", "CATEGORY_NOT_FOUND");
+    }
 
     const taskId = Number(
       db
         .prepare(
-          "INSERT INTO tasks (user_id, name, icon, type, state, progress, message, source_device_id, target_device_id, cwd, model, updated_at) " +
-            "VALUES (?, ?, ?, 'mimocode', 'queued', 0, ?, ?, ?, ?, ?, datetime('now', 'localtime'))"
+          "INSERT INTO tasks (user_id, name, icon, type, state, progress, message, source_device_id, target_device_id, cwd, model, category_id, updated_at) " +
+            "VALUES (?, ?, ?, 'mimocode', 'queued', 0, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))"
         )
-        .run(req.user.user_id, name, icon, message, srcId, tgtId, cwd, model).lastInsertRowid
+        .run(req.user.user_id, name, icon, message, srcId, tgtId, cwd, model, categoryId).lastInsertRowid
     );
 
     // 每任务一个产物目录；未指定 cwd 时默认在此执行（目录必存在）
@@ -1705,6 +1809,7 @@ export function mountTaskApi(app) {
         state: row.state,
         session_id: row.session_id,
         progress: row.progress ?? 0,
+        category_id: row.category_id ?? null,
         created_at: toISO(row.created_at),
       },
       201
@@ -1976,6 +2081,33 @@ export function mountTaskApi(app) {
     res.download(abs, rec.filename, (err) => {
       if (err && !res.headersSent) fail(res, 500, "下载失败", "DOWNLOAD_FAILED", err.message);
     });
+  });
+
+  // PUT /api/v1/tasks/{task_id} —— 更新任务分类（详情弹窗下拉切换；
+  // category_id 可为 null = 解除归类；不刷 updated_at —— 改分类不算任务活动，不影响列表排序）
+  router.put("/tasks/:taskId", requireAuth, (req, res) => {
+    const taskId = asInt(req.params.taskId);
+    if (taskId == null) return badRequest(res, "task_id 无效");
+    const row = getOwnedTask(taskId, req.user.user_id);
+    if (!row) return fail(res, 404, "任务不存在", "TASK_NOT_FOUND");
+    const b = req.body ?? {};
+    if (!("category_id" in b)) return badRequest(res, "category_id 为必填字段");
+    let categoryId = b.category_id == null || b.category_id === "" ? null : asInt(b.category_id);
+    if (b.category_id != null && b.category_id !== "" && categoryId == null) {
+      return badRequest(res, "category_id 须为整数");
+    }
+    if (categoryId != null) {
+      const owned = db
+        .prepare("SELECT 1 FROM task_categories WHERE category_id = ? AND user_id = ?")
+        .get(categoryId, req.user.user_id);
+      if (!owned) return fail(res, 400, "任务分类不存在", "CATEGORY_NOT_FOUND");
+    }
+    db.prepare("UPDATE tasks SET category_id = ? WHERE task_id = ? AND user_id = ?").run(
+      categoryId,
+      taskId,
+      req.user.user_id
+    );
+    return ok(res, { task_id: taskId, category_id: categoryId });
   });
 
   // PUT /api/v1/tasks/{task_id}/cancel —— 取消（杀掉 mimo 子进程）

@@ -4,6 +4,7 @@ import {
   listTasks, createTask, getTask, cancelTask, deleteTask,
   getMessages, sendMessage, getArtifacts, artifactUrl, uploadFiles,
   getTaskUsage, connectTaskEvents, setEventSeq, getTaskCheckpoint,
+  listCategories, createCategory, deleteCategory, updateTaskCategory,
 } from '../api/tasks.js'
 import { MD_RE, renderMarkdown } from '../lib/markdown.js'
 import { push } from '../router.js'
@@ -39,10 +40,120 @@ function toggleFilter(state) {
   statFilter.value = statFilter.value === state ? null : state
 }
 
+// ---------- 任务分类（标题旁 tab：全部 + 各分类，点 tab 筛选列表） ----------
+const categories = ref([]) // [{category_id, name}]，按创建顺序
+// 选中分类跨页面/重登持久化：localStorage 存 'all' 或 category_id（suishen.* 前缀同 auth/i18n 约定）
+const CAT_STORAGE_KEY = 'suishen.activeCat'
+function readStoredCat() {
+  try {
+    const v = localStorage.getItem(CAT_STORAGE_KEY)
+    if (v && v !== 'all') {
+      const n = Number(v)
+      return Number.isInteger(n) && n > 0 ? n : null
+    }
+  } catch {
+    /* localStorage 不可用（隐私模式）→ 默认全部 */
+  }
+  return null
+}
+const activeCat = ref(readStoredCat()) // null = 全部（默认）
+watch(activeCat, (v) => {
+  try {
+    localStorage.setItem(CAT_STORAGE_KEY, v == null ? 'all' : String(v))
+  } catch {
+    /* 忽略写入失败，仅本次会话生效 */
+  }
+})
+const catOpen = ref(false) // 新增分类弹窗
+const catName = ref('')
+const catCreating = ref(false)
+
+async function loadCategories() {
+  try {
+    const d = await listCategories()
+    categories.value = d?.categories || []
+    // 恢复的选中分类已不存在（被删除 / 换了账号）→ 自动回「全部」
+    if (activeCat.value != null && !categories.value.some((c) => c.category_id === activeCat.value)) {
+      activeCat.value = null
+    }
+  } catch {
+    /* 分类加载失败不阻塞任务列表（tab 缺失仍可新建任务） */
+  }
+}
+
+function openCat() {
+  catName.value = ''
+  catOpen.value = true
+}
+
+async function submitCat() {
+  if (catCreating.value) return
+  const name = catName.value.trim()
+  if (!name) return toast(t('home.cat.needName'))
+  if ([...name].length > 8) return toast(t('home.cat.tooLong'))
+  if (categories.value.some((c) => c.name === name)) return toast(t('home.cat.exists'))
+  catCreating.value = true
+  try {
+    const d = await createCategory(name)
+    categories.value.push({ category_id: d.category_id, name: d.name })
+    catOpen.value = false
+    toast(t('home.cat.created'))
+  } catch (e) {
+    toast(errText(e, 'home.cat.createFailed'))
+  } finally {
+    catCreating.value = false
+  }
+}
+
+// 删除分类：仅选中某个分类 tab 时显示删除按钮；删除后该分类下任务解除归类（任务保留）
+const catDelOpen = ref(false) // 删除确认弹窗
+const catDeleting = ref(false)
+function openCatDel() {
+  if (activeCat.value == null) return
+  catDelOpen.value = true
+}
+
+async function submitCatDel() {
+  if (catDeleting.value || activeCat.value == null) return
+  const id = activeCat.value
+  catDeleting.value = true
+  try {
+    await deleteCategory(id)
+    categories.value = categories.value.filter((c) => c.category_id !== id)
+    activeCat.value = null // 回到「全部」
+    catDelOpen.value = false
+    toast(t('home.cat.deleted'))
+    await load() // 该分类下任务已解除归类，刷新列表
+  } catch (e) {
+    toast(errText(e, 'home.cat.deleteFailed'))
+  } finally {
+    catDeleting.value = false
+  }
+}
+
+// 详情弹窗：任务分类下拉切换（PUT /tasks/{id}；成功同步详情与列表口径，失败回滚下拉显示）
+async function onDetailCatChange(e) {
+  if (!detailTask.value) return
+  const sel = e.target
+  const id = sel.value === '' ? null : Number(sel.value)
+  const prev = detailTask.value.category_id ?? null
+  if (id === prev) return
+  try {
+    await updateTaskCategory(detailTask.value.task_id, id)
+    detailTask.value.category_id = id
+    toast(t('home.cat.taskUpdated'))
+    load() // 列表同步（tab 筛选口径一致；失败不打断详情）
+  } catch (err) {
+    sel.value = String(prev ?? '') // 回滚下拉显示
+    toast(errText(err, 'home.cat.taskUpdateFailed'))
+  }
+}
+
 // 新建任务弹层
 const newOpen = ref(false)
 const newName = ref('')
 const newMessage = ref('')
+const newCatId = ref(null) // 所选任务分类（null = 未分类；打开弹窗时预选当前 tab）
 const creating = ref(false)
 
 // 参考物（分步上传：选择 → chips → 提交时先 XHR 上传拿 batch_id）
@@ -63,6 +174,10 @@ const detailLoading = ref(false)
 const sendText = ref('')
 const sending = ref(false)
 const msgsBox = ref(null)
+
+// 消息列表折叠：默认只显示最新一条，其余折叠（点「展开/收起」切换）
+const msgsExpanded = ref(false)
+const visibleMsgs = computed(() => (msgsExpanded.value ? detailMsgs.value : detailMsgs.value.slice(-1)))
 
 // 当前指令 = 我发出的最新一条消息（多轮会话里 detailTask.message 只是首轮原文）
 const currentInstruction = computed(() => {
@@ -245,19 +360,26 @@ function goAddLlm() {
 }
 
 // ---------- 数据 ----------
+// 选中分类变化 → 重拉（stats 与列表按 category_id 服务端过滤，统计栏随分类变化）；
+// loadSeq 防竞态：快速切分类时丢弃过期响应
+let loadSeq = 0
 async function load() {
+  const seq = ++loadSeq
   loading.value = true
   try {
-    const data = await listTasks()
+    const data = await listTasks({ categoryId: activeCat.value })
+    if (seq !== loadSeq) return // 已有更新的请求在途，本响应过期
     stats.value = data.stats
     tasks.value = data.tasks
     setEventSeq(data.server_seq) // 快照水位：WS 重连从这里补发，不多不少
   } catch (e) {
-    toast(errText(e, 'home.toast.loadFailed'))
+    if (seq === loadSeq) toast(errText(e, 'home.toast.loadFailed'))
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
+// 切换分类 tab（含「全部」、删除分类回落、持久化恢复后的校正）→ 刷新统计与列表
+watch(activeCat, () => load())
 
 // 排队按先来先服务排序，用于 #序号
 const queueTasks = computed(() =>
@@ -270,9 +392,14 @@ const queuePos = computed(() => {
 })
 
 // 列表顺序 = API 的更新时间倒序（send 受理 / 新轮次派发 / 完成 / 取消都会刷新
-// updated_at，继续会话后任务自动冒泡到顶部），不再按状态分组
+// updated_at，继续会话后任务自动冒泡到顶部），不再按状态分组；
+// 同时叠加分类 tab 筛选（activeCat null = 全部）与统计卡状态筛选
 const visibleTasks = computed(() =>
-  statFilter.value ? tasks.value.filter((t) => t.state === statFilter.value) : tasks.value
+  tasks.value.filter(
+    (t) =>
+      (activeCat.value == null || t.category_id === activeCat.value) &&
+      (!statFilter.value || t.state === statFilter.value)
+  )
 )
 
 function startText(t) {
@@ -309,13 +436,30 @@ async function onCancel(task) {
   }
 }
 
-async function onDelete(task) {
+// 删除任务：先弹二次确认，确认后才真正删除
+const taskDelOpen = ref(false)
+const taskDelTask = ref(null)
+const taskDelBusy = ref(false)
+
+function openTaskDel(task) {
+  taskDelTask.value = task
+  taskDelOpen.value = true
+}
+
+async function submitTaskDel() {
+  if (taskDelBusy.value || !taskDelTask.value) return
+  const task = taskDelTask.value
+  taskDelBusy.value = true
   try {
     await deleteTask(task.task_id)
+    taskDelOpen.value = false
+    taskDelTask.value = null
     toast(t('home.toast.deleted'))
     await load()
   } catch (e) {
     toast(errText(e, 'home.toast.deleteFailed'))
+  } finally {
+    taskDelBusy.value = false
   }
 }
 
@@ -333,6 +477,7 @@ async function onRetry(task) {
 function openNew() {
   newName.value = ''
   newMessage.value = ''
+  newCatId.value = activeCat.value // 预选当前所在分类 tab（「全部」时为未分类）
   newOpen.value = true
 }
 
@@ -345,7 +490,7 @@ async function submitNew() {
   creating.value = true
   try {
     const batch = await uploadBatchFor(newFiles) // 有参考物先上传（按钮显示进度）
-    await createTask({ name, icon: '📌', message, upload_batch: batch })
+    await createTask({ name, icon: '📌', message, upload_batch: batch, category_id: newCatId.value })
     newFiles.value = []
     newOpen.value = false
     toast(t('home.toast.created'))
@@ -362,6 +507,9 @@ async function openDetail(t) {
   detailTask.value = null
   detailMsgs.value = []
   detailArtifacts.value = []
+  artTab.value = 'tree' // 首次进入默认显示目录树
+  expandedDirs.value = {} // 目录默认全部收起
+  msgsExpanded.value = false // 消息默认折叠，只显示最新一条
   sendText.value = ''
   sendFiles.value = []
   detailOpen.value = true
@@ -458,6 +606,50 @@ function fmtArtTime(iso) {
 const PREVIEW_RE = /\.(png|jpe?g|gif|webp|svg|html|pdf|txt|md|json|csv)$/i
 const isPreviewable = (name) => PREVIEW_RE.test(name)
 const isImageExt = (name) => /\.(png|jpe?g|gif|webp|svg)$/i.test(name)
+
+// 产物视图 tab：tree = 目录树（默认），recent = 最近（mtime 倒序平铺列表）
+const artTab = ref('tree')
+// 目录树默认全部收起：只记「已展开」的目录，空集合 = 全收起（点击文件夹才展开）
+const expandedDirs = ref({}) // { [目录相对路径]: true } = 已展开
+
+function toggleDir(path) {
+  expandedDirs.value = { ...expandedDirs.value, [path]: !expandedDirs.value[path] }
+}
+
+function countFiles(node) {
+  let n = node.files.length
+  for (const dir of node.dirs.values()) n += countFiles(dir)
+  return n
+}
+
+/** 产物平铺列表 → 目录树行（rel_path 按 / 分层；同级目录按名称排序、目录在前，文件按名称排序） */
+const treeRows = computed(() => {
+  const root = { dirs: new Map(), files: [] }
+  for (const a of detailArtifacts.value) {
+    const parts = (a.rel_path || a.filename).split('/').filter(Boolean)
+    let node = root
+    for (let i = 0; i < parts.length - 1; i++) {
+      const p = parts[i]
+      if (!node.dirs.has(p)) node.dirs.set(p, { dirs: new Map(), files: [] })
+      node = node.dirs.get(p)
+    }
+    node.files.push(a)
+  }
+  const rows = []
+  const walk = (node, depth, prefix) => {
+    for (const [name, dir] of [...node.dirs].sort((x, y) => x[0].localeCompare(y[0]))) {
+      const path = prefix ? `${prefix}/${name}` : name
+      const collapsed = !expandedDirs.value[path]
+      rows.push({ type: 'dir', key: `d:${path}`, name, path, depth, collapsed, total: countFiles(dir) })
+      if (!collapsed) walk(dir, depth + 1, path)
+    }
+    for (const a of [...node.files].sort((x, y) => x.filename.localeCompare(y.filename))) {
+      rows.push({ type: 'file', key: `f:${a.artifact_id}`, art: a, depth })
+    }
+  }
+  walk(root, 0, '')
+  return rows
+})
 
 function openPreview(a) {
   previewArt.value = a
@@ -634,6 +826,7 @@ function handleEvent(evt) {
 onMounted(async () => {
   document.addEventListener('keydown', onKeydown)
   checkLlmReady() // 当前模型为空 / 不可用 → 弹窗提醒（不阻塞列表加载）
+  loadCategories() // 分类 tab（失败不阻塞列表）
   await load() // 先拿快照 server_seq，再带 since 连 WS —— 重放恰好覆盖加载后的事件
   stopWs = connectTaskEvents(handleEvent)
 })
@@ -652,7 +845,35 @@ onUnmounted(() => {
   <div class="page">
     <!-- 内容区 -->
     <div class="content">
-      <div class="sect-title"><span class="bar" style="background: var(--purple)"></span>{{ t('home.title') }}</div>
+      <!-- 标题行：标题 + 分类 tab（全部 / 各分类，点切换筛选）+ 最右侧「新增分类」 -->
+      <div class="sect-title">
+        <span class="bar" style="background: var(--purple)"></span>
+        <span class="sect-name">{{ t('home.title') }}</span>
+        <span class="cat-tabs">
+          <button
+            type="button"
+            class="cat-tab"
+            :class="{ on: activeCat == null }"
+            @click="activeCat = null"
+          >{{ t('home.cat.all') }}</button>
+          <button
+            v-for="c in categories"
+            :key="c.category_id"
+            type="button"
+            class="cat-tab"
+            :class="{ on: activeCat === c.category_id }"
+            @click="activeCat = c.category_id"
+          >{{ c.name }}<span
+              v-if="activeCat === c.category_id"
+              class="cat-x"
+              role="button"
+              :aria-label="t('home.action.delCat')"
+              :title="t('home.action.delCat')"
+              @click.stop="openCatDel"
+            >×</span></button>
+        </span>
+        <button type="button" class="btn sm line cat-add" @click="openCat">＋ {{ t('home.action.addCat') }}</button>
+      </div>
 
       <!-- 统计：点击选中筛选对应状态，再点取消 -->
       <div class="stats">
@@ -730,15 +951,15 @@ onUnmounted(() => {
             <template v-else-if="task.state === 'failed'">
               <button class="btn sm line" @click="openDetail(task)">{{ t('home.action.viewDetail') }}</button>
               <button class="btn sm green" @click="onRetry(task)">{{ t('common.retry') }}</button>
-              <button class="btn sm red" @click="onDelete(task)">{{ t('common.delete') }}</button>
+              <button class="btn sm red" @click="openTaskDel(task)">{{ t('common.delete') }}</button>
             </template>
             <template v-else-if="task.state === 'completed'">
               <button class="btn sm line" @click="openDetail(task)">{{ t('home.action.viewDetail') }}</button>
-              <button class="btn sm red" @click="onDelete(task)">{{ t('common.delete') }}</button>
+              <button class="btn sm red" @click="openTaskDel(task)">{{ t('common.delete') }}</button>
             </template>
             <template v-else>
               <button class="btn sm line" @click="openDetail(task)">{{ t('home.action.viewDetail') }}</button>
-              <button class="btn sm red" @click="onDelete(task)">{{ t('common.delete') }}</button>
+              <button class="btn sm red" @click="openTaskDel(task)">{{ t('common.delete') }}</button>
             </template>
           </div>
         </div>
@@ -791,11 +1012,66 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <!-- 任务删除二次确认弹窗：列表卡片「删除」先弹此窗，确认后才删 -->
+    <div class="overlay" :class="{ show: taskDelOpen }" @click.self="taskDelOpen = false">
+      <div class="sheet">
+        <h3>{{ t('home.del.title') }}</h3>
+        <p class="cat-del-txt">{{ t('home.del.confirm', { name: taskDelTask?.name || '' }) }}</p>
+        <div style="display: flex; gap: 10px; margin-top: 16px">
+          <button class="btn line" style="flex: 1; justify-content: center" @click="taskDelOpen = false">{{ t('common.cancel') }}</button>
+          <button class="btn red" style="flex: 1; justify-content: center" :disabled="taskDelBusy" @click="submitTaskDel">
+            {{ taskDelBusy ? t('home.deleting') : t('common.delete') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 删除任务分类确认弹窗：删除后该分类下任务变为未分类（任务不删） -->
+    <div class="overlay" :class="{ show: catDelOpen }" @click.self="catDelOpen = false">
+      <div class="sheet">
+        <h3>{{ t('home.cat.delTitle') }}</h3>
+        <p class="cat-del-txt">{{ t('home.cat.delConfirm', { name: categories.find((c) => c.category_id === activeCat)?.name || '' }) }}</p>
+        <div style="display: flex; gap: 10px; margin-top: 16px">
+          <button class="btn line" style="flex: 1; justify-content: center" @click="catDelOpen = false">{{ t('common.cancel') }}</button>
+          <button class="btn red" style="flex: 1; justify-content: center" :disabled="catDeleting" @click="submitCatDel">
+            {{ catDeleting ? t('home.deleting') : t('common.delete') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新增任务分类弹窗：名称 ≤8 个字符 -->
+    <div class="overlay" :class="{ show: catOpen }" @click.self="catOpen = false">
+      <div class="sheet">
+        <h3>{{ t('home.cat.addTitle') }}</h3>
+        <input
+          v-model="catName"
+          class="input"
+          :placeholder="t('home.cat.placeholder')"
+          maxlength="8"
+          style="margin-bottom: 6px"
+          @keydown.enter.prevent="submitCat"
+        />
+        <div class="muted" style="margin-bottom: 6px">{{ t('home.cat.hint', { n: 8 }) }}</div>
+        <div style="display: flex; gap: 10px; margin-top: 8px">
+          <button class="btn line" style="flex: 1; justify-content: center" @click="catOpen = false">{{ t('common.cancel') }}</button>
+          <button class="btn primary" style="flex: 1; justify-content: center" :disabled="catCreating" @click="submitCat">
+            {{ catCreating ? t('home.creating') : t('common.confirm') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- 新建任务弹窗 -->
     <div class="overlay" :class="{ show: newOpen }" @click.self="newOpen = false">
       <div class="sheet">
         <h3>{{ t('home.action.newTask') }}</h3>
         <input v-model="newName" class="input" :placeholder="t('home.input.taskName')" style="margin-bottom: 14px" />
+        <!-- 选择任务分类（默认预选当前 tab 所在分类） -->
+        <select v-model="newCatId" class="input cat-select" :aria-label="t('home.input.category')" style="margin-bottom: 14px">
+          <option :value="null">{{ t('home.cat.none') }}</option>
+          <option v-for="c in categories" :key="c.category_id" :value="c.category_id">{{ c.name }}</option>
+        </select>
         <textarea
           v-model="newMessage"
           class="input ta"
@@ -863,6 +1139,21 @@ onUnmounted(() => {
               </span>
             </div>
             <div class="kv"><span class="k">{{ t('home.detail.taskId') }}</span><span class="v">{{ detailTask.task_id }}</span></div>
+            <!-- 任务分类：下拉切换（PUT /tasks/{id}，不分类 = null） -->
+            <div class="kv">
+              <span class="k">{{ t('home.detail.category') }}</span>
+              <span class="v">
+                <select
+                  class="kv-select"
+                  :value="detailTask.category_id ?? ''"
+                  :aria-label="t('home.detail.category')"
+                  @change="onDetailCatChange"
+                >
+                  <option value="">{{ t('home.cat.none') }}</option>
+                  <option v-for="c in categories" :key="c.category_id" :value="c.category_id">{{ c.name }}</option>
+                </select>
+              </span>
+            </div>
             <div class="kv"><span class="k">{{ t('home.detail.sessionId') }}</span><span class="v mono">{{ detailTask.session_id || '—' }}</span></div>
             <div v-if="detailTask.error_message" class="kv">
               <span class="k">{{ t('home.detail.errorMessage') }}</span><span class="v" style="color: var(--red)">{{ detailTask.error_message }}</span>
@@ -876,11 +1167,23 @@ onUnmounted(() => {
               </span>
             </div>
 
-            <div class="detail-sub">{{ t('home.detail.messages') }}</div>
+            <div class="detail-sub msg-head">
+              <span>{{ t('home.detail.messages') }}</span>
+              <button
+                v-if="detailMsgs.length > 1"
+                type="button"
+                class="msg-fold-btn"
+                :class="{ on: msgsExpanded }"
+                :title="msgsExpanded ? t('home.msg.collapse') : t('home.msg.expand')"
+                @click="msgsExpanded = !msgsExpanded"
+              >
+                {{ msgsExpanded ? t('home.msg.collapse') : t('home.msg.expand', { n: detailMsgs.length - 1 }) }}
+              </button>
+            </div>
             <div v-if="!detailMsgs.length" class="center muted" style="padding: 10px 0">{{ t('home.msg.empty') }}</div>
             <div v-else ref="msgsBox" class="msgs">
               <div
-                v-for="m in detailMsgs"
+                v-for="m in visibleMsgs"
                 :key="m.msg_id"
                 class="msg-row"
                 :class="m.role"
@@ -908,26 +1211,77 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <!-- 产物：列表 + 在线预览 / 下载 -->
-            <div class="detail-sub">
-              {{ t('home.artifacts.title') }} <span v-if="detailArtifacts.length" class="muted">({{ detailArtifacts.length }})</span>
+            <!-- 产物：标题行 tab（目录树 / 最近）+ 目录树或平铺列表 + 在线预览 / 下载 -->
+            <div class="detail-sub art-head">
+              <span class="art-title">
+                {{ t('home.artifacts.title') }} <span v-if="detailArtifacts.length" class="muted">({{ detailArtifacts.length }})</span>
+              </span>
+              <span class="art-tabs">
+                <button
+                  type="button"
+                  class="art-tab"
+                  :class="{ on: artTab === 'tree' }"
+                  @click="artTab = 'tree'"
+                >{{ t('home.artifacts.tab.tree') }}</button>
+                <button
+                  type="button"
+                  class="art-tab"
+                  :class="{ on: artTab === 'recent' }"
+                  @click="artTab = 'recent'"
+                >{{ t('home.artifacts.tab.recent') }}</button>
+              </span>
             </div>
             <div v-if="!detailArtifacts.length" class="center muted" style="padding: 6px 0">
               {{ t('home.artifacts.empty') }}
             </div>
-            <div v-for="a in detailArtifacts" :key="a.artifact_id" class="art-row">
-              <span class="art-name" :title="a.rel_path">{{ a.filename }}</span>
-              <span class="art-size" :title="a.mtime">{{ fmtArtTime(a.mtime) }} · {{ fmtSize(a.size) }}</span>
-              <button
-                v-if="isPreviewable(a.filename)"
-                class="btn sm line"
-                @click="openPreview(a)"
-              >{{ t('home.action.preview') }}</button>
-              <a
-                class="btn sm green"
-                :href="artifactUrl(detailTask.task_id, a.artifact_id)"
-                :download="a.filename"
-              >{{ t('home.action.download') }}</a>
+            <!-- 目录树：文件夹点击展开/收起，文件行复用预览 / 下载 -->
+            <div v-else-if="artTab === 'tree'">
+              <div
+                v-for="row in treeRows"
+                :key="row.key"
+                class="art-row"
+                :class="{ 'art-dir': row.type === 'dir' }"
+                :style="{ paddingLeft: row.depth * 14 + 'px' }"
+                @click="row.type === 'dir' && toggleDir(row.path)"
+              >
+                <template v-if="row.type === 'dir'">
+                  <span class="art-caret">{{ row.collapsed ? '▸' : '▾' }}</span>
+                  <span class="art-name" :title="row.path">📁 {{ row.name }}/</span>
+                  <span class="art-size">{{ t('home.artifacts.dirCount', { n: row.total }) }}</span>
+                </template>
+                <template v-else>
+                  <span class="art-caret"></span>
+                  <span class="art-name" :title="row.art.rel_path">{{ row.art.filename }}</span>
+                  <span class="art-size" :title="row.art.mtime">{{ fmtArtTime(row.art.mtime) }} · {{ fmtSize(row.art.size) }}</span>
+                  <button
+                    v-if="isPreviewable(row.art.filename)"
+                    class="btn sm line"
+                    @click="openPreview(row.art)"
+                  >{{ t('home.action.preview') }}</button>
+                  <a
+                    class="btn sm green"
+                    :href="artifactUrl(detailTask.task_id, row.art.artifact_id)"
+                    :download="row.art.filename"
+                  >{{ t('home.action.download') }}</a>
+                </template>
+              </div>
+            </div>
+            <!-- 最近：mtime 倒序平铺列表（API 返回顺序即最新在前） -->
+            <div v-else>
+              <div v-for="a in detailArtifacts" :key="a.artifact_id" class="art-row">
+                <span class="art-name" :title="a.rel_path">{{ a.filename }}</span>
+                <span class="art-size" :title="a.mtime">{{ fmtArtTime(a.mtime) }} · {{ fmtSize(a.size) }}</span>
+                <button
+                  v-if="isPreviewable(a.filename)"
+                  class="btn sm line"
+                  @click="openPreview(a)"
+                >{{ t('home.action.preview') }}</button>
+                <a
+                  class="btn sm green"
+                  :href="artifactUrl(detailTask.task_id, a.artifact_id)"
+                  :download="a.filename"
+                >{{ t('home.action.download') }}</a>
+              </div>
             </div>
           </div>
 
@@ -1146,10 +1500,48 @@ onUnmounted(() => {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
 }
 
-/* ===== 内容区 ===== */
-.content { flex: 1; overflow-y: auto; padding: 8px 14px 20px; -webkit-overflow-scrolling: touch }
-.sect-title { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 700; color: var(--t1); margin: 6px 2px 12px }
-.sect-title .bar { width: 4px; height: 16px; border-radius: 3px }
+/* ===== 内容区 =====
+   分栏布局：标题栏 + 统计栏固定不动，仅中间任务列表 #taskList 滚动
+   （content overflow:hidden，列表 flex:1 独立滚动） */
+.content {
+  flex: 1; display: flex; flex-direction: column;
+  overflow: hidden; padding: 8px 14px 0; -webkit-overflow-scrolling: touch;
+}
+.sect-title { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 700; color: var(--t1); margin: 6px 2px 12px; flex-shrink: 0 }
+.sect-title .bar { width: 4px; height: 16px; border-radius: 3px; flex-shrink: 0 }
+/* 任务列表：中间唯一滚动区（列表尾留白随滚动） */
+#taskList {
+  flex: 1; min-height: 0; overflow-y: auto;
+  -webkit-overflow-scrolling: touch; padding-bottom: 20px;
+}
+.sect-name { flex-shrink: 0 }
+/* 标题旁分类 tab：横向可滚动（分类多时不撑破标题行），选中态蓝底 */
+.cat-tabs {
+  flex: 1; min-width: 0; display: flex; gap: 6px;
+  overflow-x: auto; -webkit-overflow-scrolling: touch;
+  scrollbar-width: none; padding: 2px 0;
+}
+.cat-tabs::-webkit-scrollbar { display: none }
+.cat-tab {
+  flex-shrink: 0; padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--card2); color: var(--t3); font-size: 11px; font-weight: 600;
+  cursor: pointer; font-family: inherit; transition: 0.15s; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.cat-tab.on { background: rgba(59, 130, 246, 0.16); border-color: rgba(59, 130, 246, 0.4); color: var(--blue) }
+/* 选中 tab 内的删除叉（点叉弹删除确认，@click.stop 不触发 tab 切换） */
+.cat-x {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; margin-right: -3px;
+  font-size: 13px; font-weight: 700; line-height: 1;
+  color: var(--red); border-radius: 50%;
+  transition: 0.15s; user-select: none;
+}
+.cat-x:active { transform: scale(0.85); background: rgba(239, 68, 68, 0.2) }
+/* 标题行最右侧「新增分类」按钮 */
+.cat-add { flex-shrink: 0; margin-left: auto }
+/* 删除确认弹窗正文 */
+.cat-del-txt { font-size: 13px; line-height: 1.7; color: var(--t2); margin: 0; word-break: break-all }
 .card {
   background: var(--card); border-radius: var(--radius); padding: 14px; margin-bottom: 12px;
   cursor: pointer; transition: transform 0.12s;
@@ -1196,7 +1588,7 @@ onUnmounted(() => {
 @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.35 } }
 
 /* ===== 统计 ===== */
-.stats { display: flex; gap: 10px; margin-bottom: 14px }
+.stats { display: flex; gap: 10px; margin-bottom: 14px; flex-shrink: 0 }
 .stat {
   flex: 1; background: var(--card); border-radius: var(--radius); padding: 14px;
   text-align: center; cursor: pointer; transition: 0.2s;
@@ -1317,11 +1709,24 @@ onUnmounted(() => {
 .input:focus { border-color: var(--blue) }
 .input::placeholder { color: var(--t3) }
 .ta { resize: none; line-height: 1.5 }
+/* 新建任务弹窗：任务分类下拉（select 沿用 .input 外观） */
+.cat-select { appearance: none; -webkit-appearance: none; cursor: pointer }
 
 .kv { display: flex; justify-content: space-between; font-size: 12.5px; padding: 6px 0; border-bottom: 1px solid var(--line) }
 .kv:last-child { border-bottom: none }
 .kv .k { color: var(--t3); flex-shrink: 0; margin-right: 12px }
 .kv .v { color: var(--t1); font-weight: 500; word-break: break-all }
+/* 详情弹窗「任务分类」行：右对齐下拉框（沿用 kv 暗色设计语言）。
+   min-width 兜底：flex 布局里 select 会被压窄导致选中文字截断 */
+.kv-select {
+  background: var(--card2); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--t1); font-size: 12.5px; font-family: inherit; font-weight: 500;
+  padding: 4px 8px; outline: none; cursor: pointer;
+  min-width: 88px; max-width: 60%;
+  appearance: none; -webkit-appearance: none;
+}
+.kv-select:focus { border-color: var(--blue) }
+.kv-select option { background: #12192b; color: var(--t1) }
 /* 执行中的检查点：全文反转后从最后一行往上显示，一行 = 文件一行（不折行，超宽截断），
    限高两行；每秒轮询刷新 */
 .kv--ckpt { align-items: flex-start }
@@ -1337,6 +1742,15 @@ onUnmounted(() => {
 /* 详情弹层（沿用原型 detail-panel / kv 设计语言） */
 .detail-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px }
 .detail-sub { font-size: 13px; font-weight: 700; color: var(--t1); margin: 12px 0 4px }
+/* 消息记录标题行：右侧折叠/展开按钮（默认只显示最新一条） */
+.msg-head { display: flex; align-items: center; justify-content: space-between; gap: 8px }
+.msg-fold-btn {
+  flex-shrink: 0; padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--card2); color: var(--t3); font-size: 11px; font-weight: 600;
+  cursor: pointer; font-family: inherit; transition: 0.15s;
+}
+.msg-fold-btn:active { transform: scale(0.96) }
+.msg-fold-btn.on { background: rgba(59, 130, 246, 0.16); border-color: rgba(59, 130, 246, 0.4); color: var(--blue) }
 .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; font-weight: 400 !important }
 .msg-row {
   display: flex; gap: 8px; flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid var(--line);
@@ -1394,6 +1808,23 @@ onUnmounted(() => {
 .art-name { flex: 1; min-width: 0; color: var(--t1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .art-size { color: var(--t3); font-size: 11px; flex-shrink: 0 }
 a.btn { text-decoration: none; justify-content: center }
+
+/* 产物标题行 tab（目录树 / 最近） */
+.art-head { display: flex; align-items: center; justify-content: space-between; gap: 8px }
+.art-title { min-width: 0 }
+.art-tabs { display: inline-flex; gap: 6px; flex-shrink: 0 }
+.art-tab {
+  padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--card2); color: var(--t3); font-size: 11px; font-weight: 600;
+  cursor: pointer; font-family: inherit; transition: 0.15s;
+}
+.art-tab.on { background: rgba(59, 130, 246, 0.16); border-color: rgba(59, 130, 246, 0.4); color: var(--blue) }
+
+/* 目录树行：文件夹可点展开/收起 */
+.art-dir { cursor: pointer }
+.art-dir:active { background: rgba(255, 255, 255, 0.03) }
+.art-dir .art-name { font-weight: 600 }
+.art-caret { flex-shrink: 0; width: 12px; color: var(--t3); font-size: 10px; text-align: center }
 
 /* 消息全文弹窗（叠在详情之上，低于产物预览 70） */
 .msg-overlay { z-index: 60 }
